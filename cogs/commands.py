@@ -44,7 +44,7 @@ class CommandsCog(commands.Cog):
 
     @app_commands.command(name="omikuji", description="今日のおみくじを引きます")
     async def omikuji(self, interaction: discord.Interaction):
-        fortunes = ["大吉 🌟", "吉 🎯", "中吉 😊", "小吉 👍", "末吉 🌿", "凶 👻", "半吉", "元凶", "大凶", "半凶", "大狂", "狂"]
+        fortunes = ["大吉 🌟", "吉 🎯", "中吉 😊", "小吉 👍", "末吉 🌿", "凶 👻", "半吉", "元凶", "大凶", "半凶", "大狂", "狂","勉強"]
         result = random.choice(fortunes)
         await interaction.response.send_message(f"{interaction.user.mention} さんの今日の運勢は... **{result}** です！")
 

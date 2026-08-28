@@ -24,7 +24,6 @@ class Calculator(commands.Cog):
 
     if isinstance(node, ast.Constant):
       if isinstance(node.value, (int, float)):
-        # 扱える数値の大きさに制限をかける（例: 絶対値が 1e15 を超えるものは拒否）
         if abs(node.value) > 1e15:
           raise ValueError("数値が大きすぎます")
         return node.value
@@ -36,7 +35,6 @@ class Calculator(commands.Cog):
         left_val = self._eval_node(node.left)
         right_val = self._eval_node(node.right)
 
-        # 累乗（^）の指数が大きすぎる場合にフリーズを防ぐため制限
         if op_type is ast.Pow:
           if isinstance(right_val, (int, float)) and right_val > 100:
             raise ValueError("指数が大きすぎます（最大100まで）")
@@ -59,40 +57,41 @@ class Calculator(commands.Cog):
     if message.author.bot or not message.guild:
       return
 
-    content = message.content
-    calc_match = re.search(r"([0-9\.\s\+\-\*\/\(\)\^%]+)", content)
-    if calc_match:
-      expr = calc_match.group(1).strip()
-      
-      # 【制限1】長すぎる数式（40文字超）は処理しない
-      if len(expr) > 40:
-        return
+    content = message.content.strip()
 
-      has_operator = any(
-          op in expr for op in ["+", "-", "*", "/", "^", "%", "(", ")"]
-      )
-      if has_operator:
-        try:
-          clean_expr = expr.replace("^", "**")
-          result = self.safe_eval(clean_expr)
+    # 【制限1】長すぎる数式（40文字超）は処理しない
+    if len(content) > 40:
+      return
 
-          if isinstance(result, float) and result.is_integer():
-            result = int(result)
+    # 【制限2】メッセージ全体が「数字、空白、演算子」だけで構成されているかチェック（日付や文章の混入を防ぐ）
+    if not re.fullmatch(r"[0-9\.\s\+\-\*\/\(\)\^%]+", content):
+      return
 
-          embed = discord.Embed(title="🧮 計算結果", color=discord.Color.green())
-          embed.add_field(
-              name="数式", value=f"`{expr.replace('**', '^')}`", inline=False
-          )
-          embed.add_field(name="答え", value=f"**{result}**", inline=False)
+    # 演算子が含まれているかチェック
+    has_operator = any(
+        op in content for op in ["+", "-", "*", "/", "^", "%", "(", ")"]
+    )
+    if has_operator:
+      try:
+        clean_expr = content.replace("^", "**")
+        result = self.safe_eval(clean_expr)
 
-          embed.set_footer(
-              text=f"Calculated by {message.author.display_name}",
-              icon_url=message.author.display_avatar.url,
-          )
-          await message.reply(embed=embed, mention_author=False)
-        except Exception:
-          # 負荷の高い計算やエラー時は静かに無視する
-          pass
+        if isinstance(result, float) and result.is_integer():
+          result = int(result)
+
+        embed = discord.Embed(title="🧮 計算結果", color=discord.Color.green())
+        embed.add_field(
+            name="数式", value=f"`{content}`", inline=False
+        )
+        embed.add_field(name="答え", value=f"**{result}**", inline=False)
+
+        embed.set_footer(
+            text=f"Calculated by {message.author.display_name}",
+            icon_url=message.author.display_avatar.url,
+        )
+        await message.reply(embed=embed, mention_author=False)
+      except Exception:
+        pass
 
 
 async def setup(bot):
