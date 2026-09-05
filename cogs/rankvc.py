@@ -14,30 +14,26 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# 冒険者ランクの設定（テキスト版と共通）
-ADVENTURER_RANKS = {
-    777: ("🪽 God (神)", discord.Color.from_rgb(255, 0, 0)),  # 赤
-    600: ("👑 Legend（伝説の勇者）", discord.Color.from_rgb(255, 215, 0)),  # 黄金
-    400: ("🛡️ Adamantite（金剛級）", discord.Color.from_rgb(112, 128, 144)),  # アダマンタイト
-    200: ("🔮 Mythril（神銀級）", discord.Color.from_rgb(138, 43, 226)),  # ミスリル
-    100: ("⚜️ Platinum（白金級）", discord.Color.from_rgb(229, 228, 226)),  # プラチナ
-    50: ("🥇 Gold（黄金級）", discord.Color.gold()),  # ゴールド
-    25: ("⚔️ Silver（白銀級）", discord.Color.light_grey()),  # シルバー
-    5: ("🗡️ Bronze（青銅級）", discord.Color.dark_orange()),  # ブロンズ
-    1: ("🔰 Novice（駆け出し）", discord.Color.green()),  # グリーン
+# VC専用のランク定義（テキスト版とは別個にカスタマイズ可能）
+VC_RANKS = {
+    500: ("🎙️👑 Voice Master (声の神)", discord.Color.from_rgb(255, 100, 100)),
+    300: ("🎙️💎 Sound Legend (音の伝説)", discord.Color.from_rgb(255, 215, 0)),
+    150: ("🎙️⭐ Talker Elite (エリート通話者)", discord.Color.from_rgb(138, 43, 226)),
+    50: ("🎙️🎧 Active Speaker (アクティブ)", discord.Color.from_rgb(0, 191, 255)),
+    1: ("🎙️🌱 Voice Novice (ビギナー)", discord.Color.from_rgb(50, 205, 50)),
 }
 
 
-class VoiceLevelingCog(commands.Cog):
+class IndependentVoiceLevelCog(commands.Cog):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.db_pool: Optional["asyncpg.Pool"] = None
-        # {(guild_id, user_id): join_timestamp}
-        self.voice_sessions: dict[tuple[int, int], datetime] = {}
+        # {(guild_id, user_id): 入室時刻}
+        self.active_vc_sessions: dict[tuple[int, int], datetime] = {}
 
     async def cog_load(self):
-        """Cogロード時にDB接続 & 起動中のVCメンバーのセッション記録"""
+        """完全独立した専用テーブルの作成と既存VCセッションの捕捉"""
         import asyncpg
 
         db_url = os.getenv("DATABASE_URL3")
@@ -48,230 +44,143 @@ class VoiceLevelingCog(commands.Cog):
 
         self.db_pool = await asyncpg.create_pool(db_url)
 
-        # ボット起動時にすでにVCに接続しているメンバーを検出して計測開始
+        async with self.db_pool.acquire() as conn:
+            # 完全に独立したテーブル（vc_user_levels）
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS vc_user_levels (
+                    guild_id BIGINT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    vc_xp INT DEFAULT 0,
+                    vc_level INT DEFAULT 1,
+                    last_active_at TIMESTAMP WITH TIME ZONE,
+                    PRIMARY KEY (guild_id, user_id)
+                );
+            """
+            )
+
+        # 起動時にすでにVCにいるユーザーをトラッキング開始
         now = datetime.now(timezone.utc)
         for guild in self.bot.guilds:
             for vc in guild.voice_channels:
                 for member in vc.members:
                     if member.bot:
                         continue
-                    # 自分自身のみ、またはミュート状態の場合は除外
+                    # 1人のみ、あるいは耳コピ/ミュート状態の場合は除外
                     if len(vc.members) == 1 or member.voice.self_deaf or member.voice.deaf:
                         continue
-                    self.voice_sessions[(guild.id, member.id)] = now
+                    self.active_vc_sessions[(guild.id, member.id)] = now
 
-        # 定期保存ループを開始
-        self.flush_voice_xp.start()
-        logger.info("[VoiceLevelingCog] データベース接続とVC監視ループが開始されました。")
+        # 定期保存ループの起動（3分おき）
+        self.save_vc_progress.start()
+        logger.info("[IndependentVoiceLevelCog] 独立型VCレベリングシステムの初期化が完了しました。")
 
     async def cog_unload(self):
-        """Cogアンロード時にループ停止と未保存データの書き込み、DB切断"""
-        self.flush_voice_xp.cancel()
-        await self._save_all_sessions(is_unload=True)
+        """アンロード時に定期ループを停止し、残ったセッションをすべてセーブ"""
+        self.save_vc_progress.cancel()
+        await self._flush_all_sessions(force_save=True)
         if self.db_pool:
             await self.db_pool.close()
 
-    def calculate_level(self, xp: int) -> int:
-        return int((xp / 100) ** (1 / 1.5)) + 1
+    def _calc_level(self, xp: int) -> int:
+        """VC専用の独自計算式（XPが緩やかに必要になる仕様）"""
+        return int((xp / 60) ** (1 / 1.4)) + 1
 
-    def get_rank_info(self, level: int) -> tuple[str, discord.Color]:
-        for req_lvl, (rank_name, color) in ADVENTURER_RANKS.items():
+    def _get_vc_rank(self, level: int) -> tuple[str, discord.Color]:
+        """VC専用のランク名とカラーを返す"""
+        for req_lvl, (r_name, r_color) in VC_RANKS.items():
             if level >= req_lvl:
-                return rank_name, color
-        return "🔰 Novice（駆け出し）", discord.Color.green()
+                return r_name, r_color
+        return "🎙️🌱 Voice Novice (ビギナー)", discord.Color.from_rgb(50, 205, 50)
 
-    async def get_notification_channel(
-        self, guild: discord.Guild, origin_channel: discord.abc.GuildChannel, kind: str = "levelup"
-    ) -> discord.TextChannel:
-        """SettingsCog から通知用チャンネルIDを取得する"""
-        target_channel_id = None
-        settings_cog = self.bot.get_cog("SettingsCog")
-
-        if settings_cog and hasattr(settings_cog, "get_leveling_config"):
-            try:
-                config = settings_cog.get_leveling_config(guild.id)
-                if asyncio.iscoroutine(config):
-                    config = await config
-
-                if config:
-                    if isinstance(config, dict):
-                        if kind == "levelup":
-                            target_channel_id = config.get("log_levelup_channel_id") or config.get("levelup_channel_id")
-                        elif kind == "rankup":
-                            target_channel_id = config.get("log_rankup_channel_id") or config.get("rankup_channel_id") or config.get("log_levelup_channel_id")
-                    else:
-                        if kind == "levelup":
-                            target_channel_id = getattr(config, "log_levelup_channel_id", None) or getattr(config, "levelup_channel_id", None)
-                        elif kind == "rankup":
-                            target_channel_id = getattr(config, "log_rankup_channel_id", None) or getattr(config, "rankup_channel_id", None) or getattr(config, "log_levelup_channel_id", None)
-            except Exception as e:
-                logger.warning(f"SettingsCog からの設定取得に失敗しました: {e}")
-
-        if target_channel_id:
-            try:
-                channel_id_int = int(target_channel_id)
-                target_channel = guild.get_channel(channel_id_int)
-                if target_channel is None:
-                    try:
-                        target_channel = await self.bot.fetch_channel(channel_id_int)
-                    except Exception:
-                        target_channel = None
-
-                if (
-                    target_channel
-                    and isinstance(target_channel, discord.TextChannel)
-                    and target_channel.permissions_for(guild.me).send_messages
-                ):
-                    return target_channel
-            except ValueError:
-                logger.error(f"取得されたチャンネルID ({target_channel_id}) を int に変換できませんでした。")
-
-        if kind == "rankup":
-            return await self.get_notification_channel(guild, origin_channel, kind="levelup")
-
-        # フォールバックとして、サーバー内の最初のテキストチャンネルを返す
-        return guild.text_channels[0] if guild.text_channels else None
-
-    async def update_user_roles(
-        self, member: discord.Member, new_level: int
-    ) -> bool:
-        """レベルに応じて発言ランクロールを自動付与・付け替え"""
-        guild = member.guild
-        if not guild.me.guild_permissions.manage_roles:
-            return False
-
-        target_rank_name, _ = self.get_rank_info(new_level)
-        all_rank_names = {info[0] for info in ADVENTURER_RANKS.values()}
-        target_role = discord.utils.get(guild.roles, name=target_rank_name)
-
-        roles_to_remove = [
-            role for role in member.roles
-            if role.name in all_rank_names and role.name != target_rank_name
-        ]
-
-        is_rank_changed = False
-        try:
-            if roles_to_remove:
-                await member.remove_roles(*roles_to_remove, reason="VCレベルアップに伴う旧ランクの削除")
-            if target_role and target_role not in member.roles:
-                await member.add_roles(target_role, reason="VCレベルアップに伴う新ランクの付与")
-                is_rank_changed = True
-        except Exception as e:
-            logger.error(f"[{guild.name}] {member.display_name} のロール更新失敗: {e}")
-
-        return is_rank_changed
-
-    async def _add_xp_to_db(self, guild_id: int, user_id: int, add_xp: int, member: Optional[discord.Member] = None):
-        """データベースにXPを加算し、レベルアップ判定・通知を行う"""
-        if not self.db_pool or add_xp <= 0:
+    async def _add_vc_xp(self, guild_id: int, user_id: int, earned_xp: int, member: Optional[discord.Member] = None):
+        """データベースへのXP加算とレベルアップ時の処理"""
+        if not self.db_pool or earned_xp <= 0:
             return
 
         try:
             async with self.db_pool.acquire() as conn:
                 row = await conn.fetchrow(
                     """
-                    SELECT xp, level FROM user_levels 
+                    SELECT vc_xp, vc_level FROM vc_user_levels 
                     WHERE guild_id = $1 AND user_id = $2
                 """,
                     guild_id,
                     user_id,
                 )
 
-                current_xp = row["xp"] if row else 0
-                current_level = row["level"] if row else 1
+                current_xp = row["vc_xp"] if row else 0
+                current_level = row["vc_level"] if row else 1
 
-                new_xp = current_xp + add_xp
-                new_level = self.calculate_level(new_xp)
+                new_xp = current_xp + earned_xp
+                new_level = self._calc_level(new_xp)
 
                 await conn.execute(
                     """
-                    INSERT INTO user_levels (guild_id, user_id, xp, level)
-                    VALUES ($1, $2, $3, $4)
+                    INSERT INTO vc_user_levels (guild_id, user_id, vc_xp, vc_level, last_active_at)
+                    VALUES ($1, $2, $3, $4, $5)
                     ON CONFLICT (guild_id, user_id) 
                     DO UPDATE SET 
-                        xp = EXCLUDED.xp,
-                        level = EXCLUDED.level
+                        vc_xp = EXCLUDED.vc_xp,
+                        vc_level = EXCLUDED.vc_level,
+                        last_active_at = EXCLUDED.last_active_at
                 """,
                     guild_id,
                     user_id,
                     new_xp,
                     new_level,
+                    datetime.now(timezone.utc),
                 )
 
-                if new_level > current_level and member:
-                    guild = member.guild
-                    rank_name, _ = self.get_rank_info(new_level)
-                    prev_rank_name, _ = self.get_rank_info(current_level)
-
-                    # 通知チャンネルの取得
-                    text_channel = await self.get_notification_channel(guild, guild.system_channel, kind="levelup")
-                    if text_channel:
-                        try:
-                            await text_channel.send(
-                                f"🎙️🎉 {member.mention} がVC通話で **Lv.{new_level}** にレベルアップ！\n"
-                                f"現在の発言ランク: **{rank_name}**",
-                                allowed_mentions=discord.AllowedMentions(users=False),
-                            )
-                        except Exception:
-                            pass
-
-                    is_rank_changed = await self.update_user_roles(member, new_level)
-                    if prev_rank_name != rank_name or is_rank_changed:
-                        rank_channel = await self.get_notification_channel(guild, guild.system_channel, kind="rankup")
-                        embed = discord.Embed(
-                            title="👑 VOICE RANK UP!",
-                            description=f"{member.mention} がVC活動により新しいランク **【{rank_name}】** に昇格しました！",
-                            color=discord.Color.purple(),
+                # レベルアップ時のアナウンス
+                if new_level > current_level and member and member.guild.system_channel:
+                    rank_name, _ = self._get_vc_rank(new_level)
+                    try:
+                        await member.guild.system_channel.send(
+                            f"🔊✨ {member.mention} が通話活動により **VC Lv.{new_level}** にアップ！\n"
+                            f"称号: **{rank_name}**",
+                            allowed_mentions=discord.AllowedMentions(users=False),
                         )
-                        try:
-                            await rank_channel.send(embed=embed, allowed_mentions=discord.AllowedMentions(users=False))
-                        except Exception:
-                            pass
+                    except Exception:
+                        pass
 
         except Exception as e:
-            logger.error(f"[_add_xp_to_db エラー] guild:{guild_id} user:{user_id}: {e}")
+            logger.error(f"[VC XP加算エラー] guild:{guild_id} user:{user_id}: {e}")
 
-    async def _save_all_sessions(self, is_unload: bool = False):
-        """現在蓄積されているセッションの時間を計算してDBに反映し、セッションを更新する"""
-        if not self.voice_sessions:
+    async def _flush_all_sessions(self, force_save: bool = False):
+        """蓄積された滞在時間を集計してDBに書き込む"""
+        if not self.active_vc_sessions:
             return
 
         now = datetime.now(timezone.utc)
-        sessions_to_process = list(self.voice_sessions.items())
-        if is_unload:
-            self.voice_sessions.clear()
+        targets = list(self.active_vc_sessions.items())
+        if force_save:
+            self.active_vc_sessions.clear()
 
-        for (guild_id, user_id), start_time in sessions_to_process:
-            duration_minutes = (now - start_time).total_seconds() / 60.0
-            if duration_minutes < 1:
-                if not is_unload:
-                    continue  # 1分未満はスキップして次回に持ち越し
-                else:
-                    duration_minutes = 1  # アンロード時は端数を考慮
+        for (guild_id, user_id), start_time in targets:
+            minutes = (now - start_time).total_seconds() / 60.0
+            if minutes < 1 and not force_save:
+                continue
 
-            # 1分あたり 2〜5 XP をランダム付与
-            earned_xp = int(duration_minutes * random.randint(2, 5))
-            if earned_xp > 0:
+            # 1分につき 3〜6 XP を付与
+            xp_to_add = int(minutes * random.randint(3, 6))
+            if xp_to_add > 0:
                 guild = self.bot.get_guild(guild_id)
                 member = guild.get_member(user_id) if guild else None
-                await self._add_xp_to_db(guild_id, user_id, earned_xp, member)
+                await self._add_vc_xp(guild_id, user_id, xp_to_add, member)
 
-            # セッション開始時刻を現在時刻にリセット（蓄積ループ用）
-            if not is_unload:
-                self.voice_sessions[(guild_id, user_id)] = now
+            if not force_save:
+                self.active_vc_sessions[(guild_id, user_id)] = now
 
-    @tasks.loop(minutes=5.0)
-    async def flush_voice_xp(self):
-        """5分ごとにVC滞在分のXPをデータベースに定期保存する"""
-        await self._save_all_sessions(is_unload=False)
+    @tasks.loop(minutes=3.0)
+    async def save_vc_progress(self):
+        """3分ごとに自動でVC通話XPを保存"""
+        await self._flush_all_sessions(force_save=False)
 
-    @flush_voice_xp.before_loop
-    async def before_flush_voice_xp(self):
+    @save_vc_progress.before_loop
+    async def before_save_vc_progress(self):
         await self.bot.wait_until_ready()
 
-    # ==========================================
-    # 🎧 VCイベントリスナー
-    # ==========================================
     @commands.Cog.listener()
     async def on_voice_state_update(
         self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState
@@ -279,58 +188,215 @@ class VoiceLevelingCog(commands.Cog):
         if member.bot:
             return
 
-        guild_id = member.guild.id
-        user_id = member.id
-        key = (guild_id, user_id)
+        g_id = member.guild.id
+        u_id = member.id
+        key = (g_id, u_id)
         now = datetime.now(timezone.utc)
 
-        # 設定Cogによる有効確認
-        settings_cog = self.bot.get_cog("SettingsCog")
-        if settings_cog and hasattr(settings_cog, "get_leveling_config"):
+        joined = before.channel is None and after.channel is not None
+        left = before.channel is not None and after.channel is None
+        muted = not (before.self_deaf or before.deaf) and (after.self_deaf or after.deaf)
+        unmuted = (before.self_deaf or before.deaf) and not (after.self_deaf or after.deaf)
+
+        # 参加 or ミュート解除
+        if joined or unmuted:
+            if after.channel and not (after.self_deaf or after.deaf):
+                if len(after.channel.members) > 1:
+                    self.active_vc_sessions[key] = now
+
+        # 退出 or ミュート
+        elif left or muted:
+            if key in self.active_vc_sessions:
+                start_time = self.active_vc_sessions.pop(key)
+                mins = (now - start_time).total_seconds() / 60.0
+                if mins >= 1:
+                    earned = int(mins * random.randint(3, 6))
+                    await self._add_vc_xp(g_id, u_id, earned, member)
+
+        # チャンネル移動や人数変化による排他処理
+        if after.channel:
+            if len(after.channel.members) <= 1 and key in self.active_vc_sessions:
+                start_time = self.active_vc_sessions.pop(key)
+                mins = (now - start_time).total_seconds() / 60.0
+                if mins >= 1:
+                    earned = int(mins * random.randint(3, 6))
+                    await self._add_vc_xp(g_id, u_id, earned, member)
+            elif len(after.channel.members) > 1 and key not in self.active_vc_sessions and not (after.self_deaf or after.deaf):
+                self.active_vc_sessions[key] = now
+
+    # ==========================================
+    # 📌 完全独立の専用スラッシュコマンド
+    # ==========================================
+    @app_commands.command(
+        name="vclevel",
+        description="あなたの現在のVC通話レベルとランクを確認します"
+    )
+    @app_commands.describe(target="確認したいユーザー（省略可能）")
+    async def vclevel(self, interaction: discord.Interaction, target: discord.User | None = None):
+        user = target or interaction.user
+        if not interaction.guild or not self.db_pool:
+            await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+            return
+
+        async with self.db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT vc_xp, vc_level FROM vc_user_levels 
+                WHERE guild_id = $1 AND user_id = $2
+            """,
+                interaction.guild.id,
+                user.id,
+            )
+
+        xp = row["vc_xp"] if row else 0
+        lvl = row["vc_level"] if row else 1
+        rank_name, rank_color = self._get_vc_rank(lvl)
+        next_xp = int(60 * (lvl**1.4))
+
+        embed = discord.Embed(
+            title=f"🎙️ {user.display_name} のVC通話ステータス",
+            color=rank_color
+        )
+        embed.set_thumbnail(url=user.display_avatar.url)
+        embed.add_field(name="VC称号", value=f"**{rank_name}**", inline=False)
+        embed.add_field(name="VCレベル", value=f"**Lv. {lvl}**", inline=True)
+        embed.add_field(name="VC XP", value=f"**{xp}** / {next_xp} XP", inline=True)
+
+        await interaction.response.send_message(embed=embed)
+
+    @app_commands.command(
+        name="vcrank",  # 競合しない任意の独立コマンド名
+        description="このサーバーのVC通話時間ランキングTOP10を表示します"
+    )
+    async def vc_ranking(self, interaction: discord.Interaction):
+        if not interaction.guild or not self.db_pool:
+            await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+
+        async with self.db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT user_id, vc_xp, vc_level 
+                FROM vc_user_levels 
+                WHERE guild_id = $1 
+                ORDER BY vc_xp DESC 
+                LIMIT 10
+            """,
+                interaction.guild.id,
+            )
+
+        if not rows:
+            await interaction.followup.send("まだこのサーバーにはVCレベルデータがありません。")
+            return
+
+        embed = discord.Embed(
+            title=f"🏆 {interaction.guild.name} - VC通話ランキング",
+            color=discord.Color.blue(),
+        )
+
+        lines = []
+        for i, r in enumerate(rows, 1):
+            m = interaction.guild.get_member(r["user_id"])
+            name = m.display_name if m else f"ユーザー({r['user_id']})"
+            r_name, _ = self._get_vc_rank(r["vc_level"])
+            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"**{i}.**"
+            lines.append(f"{medal} **{name}** - Lv.{r['vc_level']} ({r_name}) | `{r['vc_xp']} XP`")
+
+        embed.description = "\n".join(lines)
+        await interaction.followup.send(embed=embed)
+    @app_commands.command(
+        name="sync_vc_beginner_roles",
+        description="いずれかのVCランクロールを未所有のユーザーに初期ロール（Voice Novice）を一括付与します（管理者専用）",
+    )
+    @app_commands.checks.has_permissions(administrator=True)
+    async def sync_vc_beginner_roles(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        if not guild:
+            await interaction.response.send_message(
+                "このコマンドはサーバー内でのみ使用できます。", ephemeral=True
+            )
+            return
+
+        if not guild.me.guild_permissions.manage_roles:
+            await interaction.response.send_message(
+                "❌ ボットに「ロールの管理 (Manage Roles)」権限がありません。", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        target_role_name = "🎙️🌱 Voice Novice (ビギナー)"
+        beginner_role = discord.utils.get(guild.roles, name=target_role_name)
+
+        if not beginner_role:
             try:
-                config = await settings_cog.get_leveling_config(guild_id)
-                if config and not config.get("enabled", True):
-                    return
+                beginner_role = await guild.create_role(
+                    name=target_role_name,
+                    color=discord.Color.from_rgb(50, 205, 50),
+                    reason="VC初期ロールの自動生成",
+                )
+            except discord.Forbidden:
+                await interaction.followup.send(
+                    f"❌ ロール `{target_role_name}` が存在せず、作成権限もありません。"
+                )
+                return
+
+        all_vc_role_names = {r_name for r_name, _ in VC_RANKS.values()}
+
+        added_count = 0
+        already_has_novice_count = 0
+        has_higher_rank_count = 0
+
+        members = guild.members
+        if len(members) < guild.member_count:
+            try:
+                members = [m async for m in guild.fetch_members(limit=None)]
             except Exception:
                 pass
 
-        # 1. VCに参加した、またはミュートを解除した（測定開始・再開）
-        joined_vc = before.channel is None and after.channel is not None
-        unmuted = (before.self_deaf or before.deaf) and not (after.self_deaf or after.deaf)
-        
-        # 2. VCから退出した、またはミュートにした（測定終了・精算）
-        left_vc = before.channel is not None and after.channel is None
-        muffled = not (before.self_deaf or before.deaf) and (after.self_deaf or after.deaf)
+        for member in members:
+            if member.bot:
+                continue
 
-        # 参加時判定
-        if joined_vc or unmuted:
-            if after.channel and not (after.self_deaf or after.deaf):
-                # 部屋に自分以外のメンバーが他にいるかチェック（一人ぼっち対策）
-                if len(after.channel.members) > 1:
-                    self.voice_sessions[key] = now
+            user_vc_roles = [
+                role.name for role in member.roles if role.name in all_vc_role_names
+            ]
 
-        # 退出・ミュート時判定
-        elif left_vc or muffled:
-            if key in self.voice_sessions:
-                start_time = self.voice_sessions.pop(key)
-                duration_minutes = (now - start_time).total_seconds() / 60.0
-                if duration_minutes >= 1:
-                    earned_xp = int(duration_minutes * random.randint(2, 5))
-                    await self._add_xp_to_db(guild_id, user_id, earned_xp, member)
+            if user_vc_roles:
+                if target_role_name in user_vc_roles:
+                    already_has_novice_count += 1
+                else:
+                    has_higher_rank_count += 1
+                continue
 
-        # 移動した場合や人数変化の考慮
-        if after.channel:
-            # 部屋の人数が自分含めて1人になった場合、計測を一旦精算して停止
-            if len(after.channel.members) <= 1 and key in self.voice_sessions:
-                start_time = self.voice_sessions.pop(key)
-                duration_minutes = (now - start_time).total_seconds() / 60.0
-                if duration_minutes >= 1:
-                    earned_xp = int(duration_minutes * random.randint(2, 5))
-                    await self._add_xp_to_db(guild_id, user_id, earned_xp, member)
-            # 部屋の人数が2人以上になり、かつまだセッションがなく、ミュートでない場合
-            elif len(after.channel.members) > 1 and key not in self.voice_sessions and not (after.self_deaf or after.deaf):
-                self.voice_sessions[key] = now
+            try:
+                await member.add_roles(beginner_role, reason="VC初期ロールの一括付与")
+                added_count += 1
+                await asyncio.sleep(0.3)
+            except Exception as e:
+                logger.error(f"[{guild.name}] {member.display_name} へのVC初期ロール付与失敗: {e}")
+
+        await interaction.followup.send(
+            f"✅ **VC初期ロールの一括付与が完了しました！**\n"
+            f"・新規付与: **{added_count} 人**\n"
+            f"・既に Novice 所有済み: **{already_has_novice_count} 人**\n"
+            f"・上位のVCランクを所有（除外）: **{has_higher_rank_count} 人**"
+        )
+
+    @sync_vc_beginner_roles.error
+    async def sync_vc_beginner_roles_error(
+        self,
+        interaction: discord.Interaction,
+        error: app_commands.AppCommandError,
+    ):
+        if isinstance(error, app_commands.MissingPermissions):
+            await interaction.response.send_message(
+                "❌ このコマンドを実行するには**管理者権限（Administrator）**が必要です。",
+                ephemeral=True,
+            )
 
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(VoiceLevelingCog(bot))
+    await bot.add_cog(IndependentVoiceLevelCog(bot))
