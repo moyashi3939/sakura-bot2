@@ -12,8 +12,11 @@ TOKEN = os.getenv("token")
 intents = discord.Intents.all()
 
 class MyBot(commands.Bot):
+
     def __init__(self):
+
         super().__init__(command_prefix="!skr_", intents=intents)
+
         self.remove_command("help")
 
     async def setup_hook(self):
@@ -32,11 +35,16 @@ class MyBot(commands.Bot):
                     except Exception as e:
                         print(f"❌ {cog_name} の読み込みに失敗しました: {e}")
 
+        # 💡 【追加】スラッシュコマンドの同期処理
+        try:
+            synced = await self.tree.sync()
+            print(f"✅ {len(synced)} 個のスラッシュコマンドを同期しました")
+        except Exception as e:
+            print(f"❌ スラッシュコマンドの同期に失敗しました: {e}")
+
         # 💡 【重要】再起動後もロールパネルのボタンを反応させるための設定
-        # もし role_panel が入っているCog名が「RolePanelCog」であれば以下のように呼び出します
         role_cog = self.get_cog("RolePanelCog")
         if role_cog and hasattr(role_cog, "role_view"):
-            # Cog側に用意した永続View（RolePanelViewなど）をBot本体に再登録します
             self.add_view(role_cog.role_view)
 
     # 💡 すべてのインタラクション（スラッシュコマンド等）を検知するリスナー
