@@ -376,7 +376,7 @@ class IndependentVoiceLevelCog(commands.Cog):
         await interaction.response.send_message(embed=embed)
 
     @app_commands.command(
-        name="vcitems",
+        name="vcrank",
         description="このサーバーのVC通話時間ランキングTOP10を表示します"
     )
     async def vc_ranking(self, interaction: discord.Interaction):
