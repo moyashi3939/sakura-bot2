@@ -9,12 +9,20 @@ from utils.perms import admin_or_owner
 JSON_FILE = "role_panels.json"
 
 def load_data():
-    """JSONファイルからデータを読み込む"""
+    """JSONファイルからデータを読み込む（ファイルがない、または空・破損している場合の対策を追加）"""
     if not os.path.exists(JSON_FILE):
         return {}
+    
+    # ファイルが空っぽ（0バイト）の場合は空のdictを返す
+    if os.path.getsize(JSON_FILE) == 0:
+        return {}
+
     try:
         with open(JSON_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
+    except json.JSONDecodeError:
+        print("⚠️ JSONの構文が不正です。空のデータとして初期化します。")
+        return {}
     except Exception as e:
         print(f"⚠️ JSONの読み込み中にエラーが発生しました: {e}")
         return {}
@@ -37,7 +45,7 @@ class DynamicRoleView(discord.ui.View):
         for r_id in role_ids:
             # custom_id にロールIDを埋め込むことで、再起動後も「どのロール用か」が判別可能になる
             button = discord.ui.Button(
-                label=f"ロールを切り替え", # 後で実際のロール名に書き換えます
+                label="ロール切り替え", # 再起動後のグローバル登録時はラベルがデフォルトになります
                 style=discord.ButtonStyle.primary,
                 custom_id=f"dyn_role_{r_id}"
             )
@@ -49,6 +57,10 @@ class DynamicRoleView(discord.ui.View):
         """各ボタンが押されたときの処理を生成する（クロージャ）"""
         async def button_callback(interaction: discord.Interaction):
             guild = interaction.guild
+            if not guild:
+                await interaction.response.send_message("❌ この操作はサーバー内でのみ実行できます。", ephemeral=True)
+                return
+
             role = guild.get_role(role_id) or discord.utils.get(guild.roles, id=role_id)
 
             if not role:
@@ -79,15 +91,16 @@ class RolePanelCog(commands.Cog):
     async def cog_load(self):
         """【超重要】Bot起動時に、保存されているすべてのロールID用のViewをDiscordに再登録する（再起動対策）"""
         data = load_data()
-        all_role_ids = []
+        all_role_ids = set()
         
         # 全サーバーのJSONデータから、登録されているロールIDをすべて集める
-        for guild_id, guild_data in data.items():
-            all_role_ids.extend(guild_data.get("role_ids", []))
+        for guild_data in data.values():
+            for r_id in guild_data.get("role_ids", []):
+                all_role_ids.add(r_id)
             
         if all_role_ids:
-            # 重複を削除して、現在登録されている全ロールを動かすためのViewを裏側で1通りのせておく
-            self.bot.add_view(DynamicRoleView(list(set(all_role_ids))))
+            # 永続Viewとして登録
+            self.bot.add_view(DynamicRoleView(list(all_role_ids)))
             print(f"⚙️ ロールパネルの永続Viewを再登録しました。 (対象ロール数: {len(all_role_ids)})")
 
     @app_commands.command(name="role_setup", description="複数選択できるロール付与パネルを作成します（最大6個）")
@@ -99,7 +112,6 @@ class RolePanelCog(commands.Cog):
         role5="任意のロール5つ目",
         role6="任意のロール6つ目"
     )
-    # default_permissions を使うと Discord 側でオーナーも弾かれるため、実行時チェックで管理者/オーナーのみに制限
     @app_commands.guild_only()
     @admin_or_owner()
     async def role_panel(
@@ -147,7 +159,7 @@ class RolePanelCog(commands.Cog):
         for button, role in zip(view.children, roles):
             button.label = f"✨ {role.name}"
 
-        # 📢 Bot起動時（cog_load）と同様に、新しく作られたボタンのIDも即時有効化する
+        # 📢 新しく作られたボタンのIDも即時有効化する
         self.bot.add_view(view)
 
         # パネルの見た目（Embed）を作成
@@ -165,4 +177,4 @@ class RolePanelCog(commands.Cog):
 
 # Cogを有効化するための関数
 async def setup(bot: commands.Bot):
-    await bot.add_cog(RolePanelCog(bot))
+    await bot.add_cog(RolePanelCog(bot))
