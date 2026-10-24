@@ -9,11 +9,10 @@ from utils.perms import admin_or_owner
 JSON_FILE = "role_panels.json"
 
 def load_data():
-    """JSONファイルからデータを読み込む（ファイルがない、または空・破損している場合の対策を追加）"""
+    """JSONファイルからデータを読み込む"""
     if not os.path.exists(JSON_FILE):
         return {}
     
-    # ファイルが空っぽ（0バイト）の場合は空のdictを返す
     if os.path.getsize(JSON_FILE) == 0:
         return {}
 
@@ -43,13 +42,11 @@ class DynamicRoleView(discord.ui.View):
         
         # 受け取ったロールIDの数だけ、動的にボタンを生成して追加する
         for r_id in role_ids:
-            # custom_id にロールIDを埋め込むことで、再起動後も「どのロール用か」が判別可能になる
             button = discord.ui.Button(
-                label="ロール切り替え", # 再起動後のグローバル登録時はラベルがデフォルトになります
+                label="ロール切り替え", 
                 style=discord.ButtonStyle.primary,
                 custom_id=f"dyn_role_{r_id}"
             )
-            # ボタンが押されたときの処理をセット
             button.callback = self.create_callback(r_id)
             self.add_item(button)
 
@@ -89,7 +86,7 @@ class RolePanelCog(commands.Cog):
         self.bot = bot
 
     async def cog_load(self):
-        """【超重要】Bot起動時に、保存されているすべてのロールID用のViewをDiscordに再登録する（再起動対策）"""
+        """【超重要】Bot起動時に、保存されているすべてのロールID用のViewを25個ずつに分割してDiscordに再登録する"""
         data = load_data()
         all_role_ids = set()
         
@@ -99,9 +96,14 @@ class RolePanelCog(commands.Cog):
                 all_role_ids.add(r_id)
             
         if all_role_ids:
-            # 永続Viewとして登録
-            self.bot.add_view(DynamicRoleView(list(all_role_ids)))
-            print(f"⚙️ ロールパネルの永続Viewを再登録しました。 (対象ロール数: {len(all_role_ids)})")
+            role_ids_list = list(all_role_ids)
+            chunk_size = 25
+            # DiscordのViewの最大ボタン数（25個）制限対策として分割して登録
+            for i in range(0, len(role_ids_list), chunk_size):
+                chunk = role_ids_list[i:i + chunk_size]
+                self.bot.add_view(DynamicRoleView(chunk))
+                
+            print(f"⚙️ ロールパネルの永続Viewを再登録しました。 (対象ロール総数: {len(role_ids_list)})")
 
     @app_commands.command(name="role_setup", description="複数選択できるロール付与パネルを作成します（最大6個）")
     @app_commands.describe(
