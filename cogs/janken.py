@@ -1,15 +1,30 @@
+import asyncio
+import logging
 import os
 import random
-import traceback
 import asyncpg
 import discord
 from discord import app_commands
 from discord.ext import commands
 
+from utils.db import get_pool
+
+logger = logging.getLogger(__name__)
+
 # ----------------------------------------------------
 # 設定・定数
 # ----------------------------------------------------
-DATABASE_URL2 = os.getenv("DATABASE_URL2", "YOUR_NEON_DATABASE_URL_HERE")
+# DATABASE_URL2 があればじゃんけん専用DB、無ければ共有DB(DATABASE_URL3)を使う
+DATABASE_URL2 = os.getenv("DATABASE_URL2")
+
+CREATE_SQL = """
+CREATE TABLE IF NOT EXISTS janken_stats (
+    user_id BIGINT PRIMARY KEY,
+    wins INT NOT NULL DEFAULT 0,
+    losses INT NOT NULL DEFAULT 0,
+    draws INT NOT NULL DEFAULT 0
+);
+"""
 
 HANDS = {"rock": "✊", "scissors": "✌️", "paper": "🖐️"}
 HAND_NAMES = {"rock": "グー", "scissors": "チョキ", "paper": "パー"}
@@ -90,6 +105,7 @@ class JankenView(discord.ui.View):
         self.is_bot = is_bot
         self.pool = pool
         self.message: discord.Message | None = None
+        self._lock = asyncio.Lock()  # 2人がほぼ同時に押しても判定が1回だけになるように
 
         self.choices = {
             challenger.id: None,
@@ -108,7 +124,7 @@ class JankenView(discord.ui.View):
         if self.message:
             try:
                 await self.message.edit(
-                    content="⏰ 制限時間（60秒）が切れたため、対戦はキャンセルされました。",
+                    content=f"⏰ 制限時間（{int(self.timeout or 60)}秒）が切れたため、対戦はキャンセルされました。",
                     view=self,
                 )
             except discord.HTTPException:
@@ -146,34 +162,39 @@ class JankenView(discord.ui.View):
 
     async def process_choice(self, interaction: discord.Interaction, hand: str):
         try:
-            user = interaction.user
-
-            if user.id not in self.choices:
-                await interaction.response.send_message(
-                    "❌ あなたはこの対戦のプレイヤーではありません！",
-                    ephemeral=True,
-                )
-                return
-
-            if self.choices[user.id] is not None:
-                await interaction.response.send_message(
-                    "❌ 既に手を選んでいます！", ephemeral=True
-                )
-                return
-
-            self.choices[user.id] = hand
-
-            if None in self.choices.values():
-                await interaction.response.send_message(
-                    f"✅ {HAND_NAMES[hand]} を選択しました！\n相手の入力待ちです。",
-                    ephemeral=True,
-                )
-                return
-
-            await self.judge(interaction)
-
+            async with self._lock:
+                await self._process_choice(interaction, hand)
         except Exception:
-            traceback.print_exc()
+            logger.exception("じゃんけんの処理中にエラー")
+            if not interaction.response.is_done():
+                await interaction.response.send_message("❌ エラーが発生しました。", ephemeral=True)
+
+    async def _process_choice(self, interaction: discord.Interaction, hand: str):
+        user = interaction.user
+
+        if user.id not in self.choices:
+            await interaction.response.send_message(
+                "❌ あなたはこの対戦のプレイヤーではありません！",
+                ephemeral=True,
+            )
+            return
+
+        if self.choices[user.id] is not None:
+            await interaction.response.send_message(
+                "❌ 既に手を選んでいます！", ephemeral=True
+            )
+            return
+
+        self.choices[user.id] = hand
+
+        if None in self.choices.values():
+            await interaction.response.send_message(
+                f"✅ {HAND_NAMES[hand]} を選択しました！\n相手の入力待ちです。",
+                ephemeral=True,
+            )
+            return
+
+        await self.judge(interaction)
 
     async def judge(self, interaction: discord.Interaction):
         try:
@@ -246,7 +267,7 @@ class JankenView(discord.ui.View):
             self.stop()
 
         except Exception:
-            traceback.print_exc()
+            logger.exception("じゃんけんの判定中にエラー")
 
 
 # ----------------------------------------------------
@@ -257,14 +278,22 @@ class JankenCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.pool: asyncpg.Pool | None = None
+        self._own_pool = False
 
     async def cog_load(self):
-        """Cog読み込み時にDB接続プールを作成"""
-        self.pool = await asyncpg.create_pool(DATABASE_URL2)
+        """DB接続を用意し、テーブルが無ければ作成する"""
+        if DATABASE_URL2:
+            self.pool = await asyncpg.create_pool(DATABASE_URL2, statement_cache_size=0)
+            self._own_pool = True
+        else:
+            self.pool = await get_pool(self.bot)  # 共有プール
+            self._own_pool = False
+        async with self.pool.acquire() as conn:
+            await conn.execute(CREATE_SQL)
 
     async def cog_unload(self):
-        """Cogアンロード時にプールを解放"""
-        if self.pool:
+        """専用プールの場合のみ閉じる（共有プールは閉じない）"""
+        if getattr(self, "_own_pool", False) and self.pool:
             await self.pool.close()
 
     janken_group = app_commands.Group(
@@ -284,6 +313,10 @@ class JankenCog(commands.Cog):
     ):
         try:
             challenger = interaction.user
+
+            if interaction.guild is None:
+                await interaction.response.send_message("❌ サーバー内で実行してください。", ephemeral=True)
+                return
 
             if (
                 相手 is not None
@@ -334,7 +367,9 @@ class JankenCog(commands.Cog):
             view.message = await interaction.original_response()
 
         except Exception:
-            traceback.print_exc()
+            logger.exception("/janken play でエラー")
+            if not interaction.response.is_done():
+                await interaction.response.send_message("❌ エラーが発生しました。", ephemeral=True)
 
     # 2. `/janken ranking` (ポイント順ランキング表示)
     @janken_group.command(
@@ -379,15 +414,14 @@ class JankenCog(commands.Cog):
             embed.add_field(name="順位一覧", value=rank_text, inline=False)
             embed.set_footer(text="対戦を重ねてポイントをためよう！")
 
-            await interaction.followup.send(embed=embed)
+            await interaction.followup.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
-        except Exception as e:
-            traceback.print_exc()
+        except Exception:
+            logger.exception("ランキング取得エラー")
             await interaction.followup.send(
                 "❌ ランキングの取得中にエラーが発生しました。"
             )
 
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(JankenCog(bot))
-    await bot.tree.sync()
+    await bot.add_cog(JankenCog(bot))

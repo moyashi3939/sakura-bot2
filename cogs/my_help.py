@@ -3,6 +3,8 @@ from discord import app_commands
 from discord.ext import commands
 from discord.ui import View, Button
 
+from utils.perms import is_admin_command
+
 class HelpPaginator(View):
     def __init__(self, embeds: list[discord.Embed]):
         super().__init__(timeout=180)  # 3分でボタンが無効化されます
@@ -54,23 +56,22 @@ class HelpCog(commands.Cog):
         user_cmds_list = []
         admin_cmds_list = []
 
-        # 💡 bot.tree から登録されている全スラッシュコマンドをすべて自動取得
+        # bot.tree から登録されている全スラッシュコマンドを自動取得
+        # admin_or_owner が付いているものは管理者コマンドとして分類する
         for cmd in self.bot.tree.get_commands():
             if isinstance(cmd, app_commands.Command):
-                cmd_name = f"**/{cmd.name}**"
-                cmd_desc = cmd.description or "説明なし"
-
-                # 管理者権限が設定されているかどうかで分類
-                if cmd.default_permissions and cmd.default_permissions.administrator:
-                    admin_cmds_list.append(f"🔘 {cmd_name}\n└ {cmd_desc}\n")
-                else:
-                    user_cmds_list.append(f"🔹 {cmd_name}\n└ {cmd_desc}\n")
+                line = f"**/{cmd.name}**\n└ {cmd.description or '説明なし'}\n"
+                (admin_cmds_list if is_admin_command(cmd) else user_cmds_list).append(f"🔘 {line}" if is_admin_command(cmd) else f"🔹 {line}")
 
             elif isinstance(cmd, app_commands.Group):
                 for sub_cmd in cmd.commands:
-                    cmd_name = f"**/{cmd.name} {sub_cmd.name}**"
-                    cmd_desc = sub_cmd.description or "説明なし"
-                    user_cmds_list.append(f"🔹 {cmd_name}\n└ {cmd_desc}\n")
+                    if not isinstance(sub_cmd, app_commands.Command):
+                        continue
+                    line = f"**/{cmd.name} {sub_cmd.name}**\n└ {sub_cmd.description or '説明なし'}\n"
+                    if is_admin_command(sub_cmd):
+                        admin_cmds_list.append(f"🔘 {line}")
+                    else:
+                        user_cmds_list.append(f"🔹 {line}")
 
         # 1024文字オーバーを防ぐためのチャンク（分割）関数
         def create_chunks(commands_list):
@@ -91,8 +92,9 @@ class HelpCog(commands.Cog):
                 chunks.append("\n".join(current_chunk))
             return chunks
 
+        show_admin = interaction.permissions.administrator or await self.bot.is_owner(interaction.user)
         user_chunks = create_chunks(user_cmds_list) if user_cmds_list else ["コマンドはありません"]
-        admin_chunks = create_chunks(admin_cmds_list) if (interaction.permissions.administrator and admin_cmds_list) else []
+        admin_chunks = create_chunks(admin_cmds_list) if (show_admin and admin_cmds_list) else []
 
         embeds = []
         bot_avatar = self.bot.user.display_avatar.url if self.bot.user else None
@@ -109,7 +111,7 @@ class HelpCog(commands.Cog):
             embeds.append(embed)
 
         # 管理者コマンドがある場合は専用ページを追加
-        if interaction.permissions.administrator and admin_chunks:
+        if show_admin and admin_chunks:
             for i, chunk in enumerate(admin_chunks):
                 embed = discord.Embed(
                     title="📚 sakura-bot2 管理者コマンド一覧",
@@ -134,42 +136,47 @@ class HelpCog(commands.Cog):
         view.message = message
 
 
-    @commands.command(name="skr_help")
-    @commands.is_owner()
-    async def skr_help_command(self, ctx):
+    @commands.command(name="help", aliases=["skr_help"], extras={"access": "all"})
+    async def prefix_help(self, ctx):
+        """テキストコマンド（!skr_）の一覧を表示します"""
+        is_owner = await self.bot.is_owner(ctx.author)
+        is_admin = is_owner or (ctx.guild is not None and ctx.author.guild_permissions.administrator)
+
+        sections = {
+            "all": ("👥 誰でも使えるコマンド", []),
+            "admin": ("🔒 管理者コマンド（ボットオーナーは権限不問）", []),
+            "owner": ("👑 オーナー専用コマンド", []),
+        }
+        for cmd in sorted(self.bot.commands, key=lambda c: c.name):
+            access = cmd.extras.get("access", "all")
+            if access == "owner" and not is_owner:
+                continue
+            if access == "admin" and not is_admin:
+                continue
+            desc = cmd.help or (cmd.callback.__doc__.strip() if cmd.callback.__doc__ else "説明文が設定されていません。")
+            sections[access][1].append(f"⚡ **{ctx.clean_prefix}{cmd.name}** {cmd.signature}\n└ {desc}\n")
+
         embed = discord.Embed(
-            title="👑 sakura-bot2 オーナー限定コマンド一覧 👑",
-            description="Botの所有者（あなた）のみが実行できる、ダイレクトなテキスト管理コマンドです。",
-            color=discord.Color.red()
+            title="📚 sakura-bot2 テキストコマンド一覧",
+            description="`/help` ではスラッシュコマンドの一覧を確認できます。",
+            color=discord.Color.red() if is_owner else discord.Color.blurple(),
         )
-        
-        owner_cmds_list = []
-
-        # 💡 bot.commands から登録されているテキスト（Prefix）コマンドをスキップせず全て自動取得
-        for cmd in self.bot.commands:
-            prefix = ctx.clean_prefix  # 設定中のプレフィックス（! など）
-            cmd_name = f"⚡ **{prefix}{cmd.name}**"
-            
-            # コマンドの help 引数、または関数の Docstring ("""〜""") から説明を取得
-            cmd_desc = cmd.help or (cmd.callback.__doc__.strip() if cmd.callback.__doc__ else "説明文が設定されていません。")
-            
-            owner_cmds_list.append(f"{cmd_name}\n└ {cmd_desc}\n")
-
-        # 取得したコマンド一覧を Embed に追加
-        if owner_cmds_list:
-            embed.add_field(
-                name="🛠️ システム管理コマンド",
-                value="\n".join(owner_cmds_list),
-                inline=False
-            )
-        else:
-            embed.add_field(name="🛠️ システム管理コマンド", value="利用可能なコマンドがありません。", inline=False)
+        for title, items in sections.values():
+            # Embedのフィールド上限(1024文字)を超えないよう分割
+            chunk, length = [], 0
+            for item in items:
+                if length + len(item) > 950:
+                    embed.add_field(name=title, value="\n".join(chunk), inline=False)
+                    chunk, length = [], 0
+                chunk.append(item)
+                length += len(item)
+            if chunk:
+                embed.add_field(name=title, value="\n".join(chunk), inline=False)
 
         bot_avatar = self.bot.user.display_avatar.url if self.bot.user else None
         embed.set_footer(text="SAKURA-BOT System", icon_url=bot_avatar)
-
-        # 送信元メッセージの削除を行わず、そのまま全員（※オーナーのみ実行可能）に見える形で送信
         await ctx.send(embed=embed)
 
+
 async def setup(bot: commands.Bot):
-    await bot.add_cog(HelpCog(bot))
+    await bot.add_cog(HelpCog(bot))

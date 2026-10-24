@@ -6,8 +6,14 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 import inspect
+import unicodedata
 
 # ── 🔴 クイズ早押しView ──
+def normalize_answer(text: str) -> str:
+    """全角/半角・大文字小文字・空白の違いを無視して比較できるようにする"""
+    return "".join(unicodedata.normalize("NFKC", text).casefold().split())
+
+
 class QuizBuzzerView(discord.ui.View):
     def __init__(
         self,
@@ -17,8 +23,10 @@ class QuizBuzzerView(discord.ui.View):
         embed: discord.Embed,
         quiz_timeout: float = 900.0,
         answer_timeout: float = 15.0,
+        author_id: int | None = None,
     ):
         super().__init__(timeout=quiz_timeout)
+        self.author_id = author_id  # 出題者は解答不可
         self.bot = bot
         self.answer = answer.strip()
         self.start_time = start_time
@@ -35,6 +43,11 @@ class QuizBuzzerView(discord.ui.View):
         if self.is_processing:
             await interaction.response.send_message(
                 "遅かった！すでに他の人がボタンを押しています。", ephemeral=True
+            )
+            return
+        if interaction.user.id == self.author_id:
+            await interaction.response.send_message(
+                "❌ 出題者は解答できません。", ephemeral=True
             )
             return
         if interaction.user.id in self.wrong_users:
@@ -65,14 +78,17 @@ class QuizBuzzerView(discord.ui.View):
             user_msg = await self.bot.wait_for(
                 "message", check=check_answer, timeout=self.answer_timeout
             )
-            if user_msg.content.strip().lower() == self.answer.lower():
+            if normalize_answer(user_msg.content) == normalize_answer(self.answer):
                 await user_msg.reply(
                     f"🎉 **正解！！**\n答えは「**{self.answer}**」でした！"
                 )
                 self.stop()
                 button.label = "正解が出ました 🎉"
                 button.style = discord.ButtonStyle.success
-                await self.quiz_message.edit(view=self)
+                try:
+                    await self.quiz_message.edit(view=self)
+                except discord.HTTPException:
+                    pass
                 return
             else:
                 await user_msg.reply(
@@ -93,10 +109,10 @@ class QuizBuzzerView(discord.ui.View):
         self.base_embed.set_footer(
             text=f"※解答権喪失: {', '.join(lost_mentions)}\nまだの人はボタンを押せます！"
         )
-        await self.quiz_message.edit(embed=self.base_embed, view=self)
         try:
+            await self.quiz_message.edit(embed=self.base_embed, view=self)
             await announce_msg.delete()
-        except discord.NotFound:
+        except discord.HTTPException:
             pass
 
     async def on_timeout(self):
@@ -111,7 +127,7 @@ class QuizBuzzerView(discord.ui.View):
                 await self.quiz_message.reply(
                     f"⏰ **時間切れでクイズ終了です！**\n正解は「**{self.answer}**」でした！"
                 )
-            except discord.NotFound:
+            except discord.HTTPException:
                 pass
 
 
@@ -140,12 +156,26 @@ class QuizCog(commands.Cog):
         return 900.0, 15.0
 
     @app_commands.command(name="quiz", description="早押しクイズを出題します！")
+    @app_commands.guild_only()
     @app_commands.describe(
         問題="クイズの問題文を入力してください",
         答え="クイズの正解を入力してください"
     )
     async def quiz(self, interaction: discord.Interaction, 問題: str, 答え: str):
         try:
+            # /setting quiz で専用チャンネルが設定されていれば、そこでのみ出題できる
+            settings_cog = self.bot.get_cog("SettingsCog")
+            if settings_cog:
+                quiz_ch = (await settings_cog.get_quiz_config(interaction.guild_id)).get("quiz_channel_id")
+                if quiz_ch and interaction.channel_id != quiz_ch:
+                    await interaction.response.send_message(
+                        f"❌ クイズは <#{quiz_ch}> で出題してください。", ephemeral=True
+                    )
+                    return
+            if len(問題) > 1500:
+                await interaction.response.send_message("❌ 問題文が長すぎます（1500文字以内）。", ephemeral=True)
+                return
+
             embed = discord.Embed(
                 title="❓ 早押しクイズ！",
                 description=f"**問題：**\n{問題} ({interaction.user.mention})",
@@ -170,12 +200,15 @@ class QuizCog(commands.Cog):
                 embed=embed,
                 quiz_timeout=quiz_timeout,
                 answer_timeout=answer_timeout,
+                author_id=interaction.user.id,
             )
 
             await interaction.response.send_message(
                 "📢 クイズを出題しました！", ephemeral=True
             )
-            quiz_message = await interaction.channel.send(embed=embed, view=view)
+            quiz_message = await interaction.channel.send(
+                embed=embed, view=view, allowed_mentions=discord.AllowedMentions.none()
+            )
             view.quiz_message = quiz_message
 
         except Exception as e:
@@ -188,4 +221,4 @@ class QuizCog(commands.Cog):
 
 # ── 🚀 setup 関数 ──
 async def setup(bot: commands.Bot):
-    await bot.add_cog(QuizCog(bot))
+    await bot.add_cog(QuizCog(bot))

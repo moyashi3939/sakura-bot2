@@ -33,7 +33,7 @@ class EEWCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.bg_task: asyncio.Task | None = None
-        self.processed_codes: set[str] = set()
+        self.processed_codes: set[str] = set()  # 重複通知防止（上限を超えたら全消去）
         logger.info("[EEWCog] P2P地震情報版 EEWCog が初期化されました。")
 
     @commands.Cog.listener()
@@ -88,6 +88,10 @@ class EEWCog(commands.Cog):
                         if code not in [551, 556]:
                             continue
 
+                        # テスト配信（test: true）は通知しない
+                        if data.get("test"):
+                            continue
+
                         logger.info(f"[P2P受信データ] ──> code: {code}, 内容: {json.dumps(data, ensure_ascii=False)[:200]}...")
 
                         target_channels = await self.get_all_eew_targets()
@@ -103,6 +107,14 @@ class EEWCog(commands.Cog):
                             cancelled = issue.get("type") == "Cancel"
                             if cancelled:
                                 continue
+                            if len(self.processed_codes) > 200:
+                                self.processed_codes.clear()
+
+                            # 同じ速報の続報(同一ID)で何度も通知しない
+                            event_key = f"556:{data.get('id', data.get('time', ''))}"
+                            if event_key in self.processed_codes:
+                                continue
+                            self.processed_codes.add(event_key)
 
                             parse_time = data.get("time", "不明")
                             embed = discord.Embed(
@@ -134,8 +146,8 @@ class EEWCog(commands.Cog):
                             if event_id in self.processed_codes:
                                 continue
                             self.processed_codes.add(event_id)
-                            if len(self.processed_codes) > 100:
-                                self.processed_codes.pop(next(iter(self.processed_codes)))
+                            if len(self.processed_codes) > 200:
+                                self.processed_codes.clear()
 
                             embed = discord.Embed(
                                 title=f"⚠️ **【地震情報】最大震度 {shindo_str}**",
@@ -242,4 +254,4 @@ class EEWCog(commands.Cog):
 
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(EEWCog(bot))
+    await bot.add_cog(EEWCog(bot))

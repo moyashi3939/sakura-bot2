@@ -9,6 +9,9 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
+from utils.db import get_pool
+from utils.perms import admin_or_owner
+
 if TYPE_CHECKING:
     import asyncpg
 
@@ -35,15 +38,7 @@ class IndependentVoiceLevelCog(commands.Cog):
 
     async def cog_load(self):
         """完全独立した専用テーブルの作成と既存VCセッションの捕捉"""
-        import asyncpg
-
-        db_url = os.getenv("DATABASE_URL3")
-        if not db_url:
-            raise ValueError(
-                "環境変数 'DATABASE_URL3' が設定されていません。"
-            )
-
-        self.db_pool = await asyncpg.create_pool(db_url)
+        self.db_pool = await get_pool(self.bot)  # 共有プール
 
         async with self.db_pool.acquire() as conn:
             await conn.execute(
@@ -78,8 +73,7 @@ class IndependentVoiceLevelCog(commands.Cog):
         """アンロード時に定期ループを停止し、残ったセッションをすべてセーブ"""
         self.save_vc_progress.cancel()
         await self._flush_all_sessions(force_save=True)
-        if self.db_pool:
-            await self.db_pool.close()
+        # 共有プールなのでここでは閉じない
 
     def _calc_level(self, xp: int) -> int:
         return int((xp / 60) ** (1 / 1.4)) + 1
@@ -422,7 +416,8 @@ class IndependentVoiceLevelCog(commands.Cog):
         name="sync_vc_beginner_roles",
         description="いずれかのVCランクロールを未所有のユーザーに初期ロール（Voice Novice）を一括付与します（管理者専用）",
     )
-    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.guild_only()
+    @admin_or_owner()
     async def sync_vc_beginner_roles(self, interaction: discord.Interaction):
         guild = interaction.guild
         if not guild:
@@ -497,18 +492,7 @@ class IndependentVoiceLevelCog(commands.Cog):
             f"・上位のVCランクを所有（除外）: **{has_higher_rank_count} 人**"
         )
 
-    @sync_vc_beginner_roles.error
-    async def sync_vc_beginner_roles_error(
-        self,
-        interaction: discord.Interaction,
-        error: app_commands.AppCommandError,
-    ):
-        if isinstance(error, app_commands.MissingPermissions):
-            await interaction.response.send_message(
-                "❌ このコマンドを実行するには**管理者権限（Administrator）**が必要です。",
-                ephemeral=True,
-            )
 
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(IndependentVoiceLevelCog(bot))
+    await bot.add_cog(IndependentVoiceLevelCog(bot))

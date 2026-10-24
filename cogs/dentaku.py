@@ -38,6 +38,8 @@ class Calculator(commands.Cog):
         if op_type is ast.Pow:
           if isinstance(right_val, (int, float)) and right_val > 100:
             raise ValueError("指数が大きすぎます（最大100まで）")
+          if isinstance(left_val, (int, float)) and abs(left_val) > 1e6 and right_val > 10:
+            raise ValueError("計算結果が大きすぎます")
 
         return operators[op_type](left_val, right_val)
 
@@ -65,6 +67,11 @@ class Calculator(commands.Cog):
 
     # 【制限2】メッセージ全体が「数字、空白、演算子」だけで構成されているかチェック（日付や文章の混入を防ぐ）
     if not re.fullmatch(r"[0-9\.\s\+\-\*\/\(\)\^%]+", content):
+      return
+
+    # /setting features で電卓がOFFのサーバーでは反応しない
+    settings_cog = self.bot.get_cog("SettingsCog")
+    if settings_cog and not await settings_cog.is_feature_enabled(message.guild.id, "calculator"):
       return
 
     # 演算子が含まれているかチェック
@@ -95,4 +102,4 @@ class Calculator(commands.Cog):
 
 
 async def setup(bot):
-  await bot.add_cog(Calculator(bot))
+  await bot.add_cog(Calculator(bot))

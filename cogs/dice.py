@@ -1,72 +1,81 @@
-import os
 import random
 import re
+
 import asyncpg
 import discord
 from discord import app_commands
 from discord.ext import commands
+
+from utils.db import get_pool
+from utils.perms import admin_or_owner
 
 
 class Dice(commands.Cog):
 
     def __init__(self, bot):
         self.bot = bot
-        self.pool = None
+        self.pool: asyncpg.Pool | None = None
+        # {guild_id: enabled} メッセージのたびにDBへ問い合わせないためのキャッシュ
+        self._cache: dict[int, bool] = {}
 
     async def cog_load(self):
-        """Cogがロードされた時にデータベースプールを作成し、テーブルとカラムを初期化する"""
-        database_url = os.getenv("DATABASE_URL3")
-        if not database_url:
-            raise ValueError("環境変数 'DATABASE_URL3' が設定されていません。")
-        
-        # ★ statement_cache_size=0 を追加してキャッシュエラーを防ぐ
-        self.pool = await asyncpg.create_pool(database_url, statement_cache_size=0)
-        
-        # テーブルおよびカラムの確実な初期化
+        """共有プールを取得し、専用テーブルを初期化する"""
+        self.pool = await get_pool(self.bot)
+
         async with self.pool.acquire() as connection:
+            # 以前は setting.py と同じ guild_settings テーブルを共用していたが、
+            # 列定義が衝突するため専用テーブルに分離した
             await connection.execute(
                 """
-                CREATE TABLE IF NOT EXISTS guild_settings (
+                CREATE TABLE IF NOT EXISTS dice_settings (
                     guild_id BIGINT PRIMARY KEY,
-                    enabled BOOLEAN NOT NULL
+                    enabled BOOLEAN NOT NULL DEFAULT FALSE
                 )
                 """
             )
-            # すでにテーブルが存在していてカラムがない場合の対策
-            await connection.execute(
+            # 旧テーブルに保存済みの設定を一度だけ引き継ぐ（既にある設定は上書きしない）
+            has_old_column = await connection.fetchval(
                 """
-                ALTER TABLE guild_settings 
-                ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT FALSE
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'guild_settings' AND column_name = 'enabled'
+                )
                 """
             )
-
-    async def cog_unload(self):
-        """Cogがアンロードされる時にプールを閉じる"""
-        if self.pool:
-            await self.pool.close()
+            if has_old_column:
+                await connection.execute(
+                    """
+                    INSERT INTO dice_settings (guild_id, enabled)
+                    SELECT guild_id, enabled FROM guild_settings WHERE enabled IS NOT NULL
+                    ON CONFLICT (guild_id) DO NOTHING
+                    """
+                )
 
     async def get_enabled(self, guild_id: int) -> bool:
         """サーバーのダイス設定を取得する（デフォルトはFalse）"""
+        if guild_id in self._cache:
+            return self._cache[guild_id]
         async with self.pool.acquire() as connection:
             row = await connection.fetchrow(
-                "SELECT enabled FROM guild_settings WHERE guild_id = $1", guild_id
+                "SELECT enabled FROM dice_settings WHERE guild_id = $1", guild_id
             )
-            if row is None:
-                return False
-            return row["enabled"]
+        enabled = bool(row["enabled"]) if row else False
+        self._cache[guild_id] = enabled
+        return enabled
 
     async def set_enabled(self, guild_id: int, enabled: bool):
         """サーバーのダイス設定を保存する（UPSERT）"""
         async with self.pool.acquire() as connection:
             await connection.execute(
                 """
-                INSERT INTO guild_settings (guild_id, enabled)
+                INSERT INTO dice_settings (guild_id, enabled)
                 VALUES ($1, $2)
-                ON CONFLICT (guild_id) 
+                ON CONFLICT (guild_id)
                 DO UPDATE SET enabled = EXCLUDED.enabled
                 """,
                 guild_id, enabled
             )
+        self._cache[guild_id] = enabled
 
     @app_commands.command(name="roll", description="このサーバーのダイス機能の有効/無効を切り替えます")
     @app_commands.describe(status="有効にするか無効にするかを選択してください")
@@ -74,7 +83,8 @@ class Dice(commands.Cog):
         app_commands.Choice(name="有効", value="enable"),
         app_commands.Choice(name="無効", value="disable"),
     ])
-    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.guild_only()
+    @admin_or_owner()
     async def roll_setting(self, interaction: discord.Interaction, status: str):
         guild_id = interaction.guild_id
 
@@ -85,24 +95,17 @@ class Dice(commands.Cog):
             await self.set_enabled(guild_id, False)
             await interaction.response.send_message("❌ このサーバーでダイス機能を**無効**にしました", ephemeral=True)
 
-    @roll_setting.error
-    async def roll_setting_error(
-        self, interaction: discord.Interaction, error: app_commands.AppCommandError
-    ):
-        if isinstance(error, app_commands.CheckFailure):
-            await interaction.response.send_message("❌ このコマンドを実行するには**サーバー管理者**の権限が必要です。", ephemeral=True)
-
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if message.author.bot or not message.guild:
             return
 
-        # データベースから非同期で設定を取得
-        if not await self.get_enabled(message.guild.id):
-            return
-            
+        # 先に軽いパターン判定をして、無関係なメッセージではDBを見に行かない
         match = re.search(r"\b(\d+)d(\d+)\b", message.content.lower())
         if not match:
+            return
+
+        if not await self.get_enabled(message.guild.id):
             return
 
         count = int(match.group(1))
@@ -111,7 +114,7 @@ class Dice(commands.Cog):
 
         if count <= 0 or sides <= 0 or count > 100 or sides > 100000:
             return
-        
+
         results = [random.randint(1, sides) for _ in range(count)]
         total = sum(results)
 
@@ -124,7 +127,7 @@ class Dice(commands.Cog):
             description = f"**{dice_str}**\n[{results[0]}] > {total}"
 
         embed = discord.Embed(
-            description=description, 
+            description=description,
             color=discord.Color.dark_embed()
         )
 

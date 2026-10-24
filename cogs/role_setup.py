@@ -4,6 +4,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from utils.perms import admin_or_owner
+
 JSON_FILE = "role_panels.json"
 
 def load_data():
@@ -97,7 +99,9 @@ class RolePanelCog(commands.Cog):
         role5="任意のロール5つ目",
         role6="任意のロール6つ目"
     )
-    @app_commands.default_permissions(administrator=True) # スラッシュコマンドのデフォルト権限を管理者に限定
+    # default_permissions を使うと Discord 側でオーナーも弾かれるため、実行時チェックで管理者/オーナーのみに制限
+    @app_commands.guild_only()
+    @admin_or_owner()
     async def role_panel(
         self, 
         interaction: discord.Interaction, 
@@ -111,6 +115,17 @@ class RolePanelCog(commands.Cog):
         # 選択されたロールをリストにまとめる（Noneを除外）
         raw_roles = [role1, role2, role3, role4, role5, role6]
         roles = [r for r in raw_roles if r is not None]
+
+        # @everyone・Bot連携ロール・Botより上位のロールはボタンで付与できないため弾く
+        me = interaction.guild.me
+        invalid = [r for r in roles if r.is_default() or r.managed or r >= me.top_role]
+        if invalid:
+            names = "、".join(r.mention for r in invalid)
+            await interaction.response.send_message(
+                f"❌ 次のロールはパネルに追加できません（@everyone / 連携ロール / Botより上位のロール）: {names}",
+                ephemeral=True,
+            )
+            return
 
         guild_id = str(interaction.guild_id)
         role_ids = [r.id for r in roles]
@@ -150,4 +165,4 @@ class RolePanelCog(commands.Cog):
 
 # Cogを有効化するための関数
 async def setup(bot: commands.Bot):
-    await bot.add_cog(RolePanelCog(bot))
+    await bot.add_cog(RolePanelCog(bot))

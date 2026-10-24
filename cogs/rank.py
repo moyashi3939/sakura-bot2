@@ -9,6 +9,9 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from utils.db import get_pool
+from utils.perms import admin_or_owner
+
 if TYPE_CHECKING:
     import asyncpg
 
@@ -37,15 +40,7 @@ class LevelingCog(commands.Cog):
 
     async def cog_load(self):
         """Cogロード時にDB接続 & テーブル自動作成"""
-        import asyncpg
-
-        db_url = os.getenv("DATABASE_URL3")
-        if not db_url:
-            raise ValueError(
-                "環境変数 'DATABASE_URL3' が設定されていません。"
-            )
-
-        self.db_pool = await asyncpg.create_pool(db_url)
+        self.db_pool = await get_pool(self.bot)  # 共有プール
 
         async with self.db_pool.acquire() as conn:
             # ユーザーレベル管理テーブル
@@ -62,11 +57,6 @@ class LevelingCog(commands.Cog):
             """
             )
         logger.info("[LevelingCog] データベース接続とテーブル確認が完了しました。")
-
-    async def cog_unload(self):
-        """Cogアンロード時にDB接続を切断"""
-        if self.db_pool:
-            await self.db_pool.close()
 
     def calculate_level(self, xp: int) -> int:
         """累積XPからレベルを計算"""
@@ -444,7 +434,8 @@ class LevelingCog(commands.Cog):
         name="role",
         description="発言システム用ロールの確認および未作成ロールを追加します（管理者専用）",
     )
-    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.guild_only()
+    @admin_or_owner()
     async def role(self, interaction: discord.Interaction):
         guild = interaction.guild
         if not guild:
@@ -470,24 +461,13 @@ class LevelingCog(commands.Cog):
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @role.error
-    async def role_error(
-        self,
-        interaction: discord.Interaction,
-        error: app_commands.AppCommandError,
-    ):
-        if isinstance(error, app_commands.MissingPermissions):
-            await interaction.response.send_message(
-                "❌ このコマンドを実行するには**管理者権限（Administrator）**が必要です。",
-                ephemeral=True,
-            )
-
     # --- サーバー全員にビギナーロールを一括付与するコマンド (管理者限定) ---
     @app_commands.command(
         name="sync_beginner_roles",
         description="いずれかのランクロールを未所有のユーザーに初期ロール（Novice）を一括付与します（管理者専用）",
     )
-    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.guild_only()
+    @admin_or_owner()
     async def sync_beginner_roles(self, interaction: discord.Interaction):
         guild = interaction.guild
         if not guild:
@@ -553,18 +533,6 @@ class LevelingCog(commands.Cog):
             f"・上位ランク所有（除外）: **{has_higher_rank_count} 人**"
         )
 
-    @sync_beginner_roles.error
-    async def sync_beginner_roles_error(
-        self,
-        interaction: discord.Interaction,
-        error: app_commands.AppCommandError,
-    ):
-        if isinstance(error, app_commands.MissingPermissions):
-            await interaction.response.send_message(
-                "❌ このコマンドを実行するには**管理者権限（Administrator）**が必要です。",
-                ephemeral=True,
-            )
-
     # --- /add_exp コマンド (ボットオーナー限定) ---
     @app_commands.command(
         name="add_exp",
@@ -580,7 +548,7 @@ class LevelingCog(commands.Cog):
         target_user: discord.Member,
         amount: int,
     ):
-        # ボットオーナー判定
+        # ボットオーナー判定（OWNER_IDS も含む）
         if not await self.bot.is_owner(interaction.user):
             await interaction.response.send_message(
                 "❌ このコマンドは**ボットオーナー**のみ実行できます。", ephemeral=True
@@ -647,4 +615,4 @@ class LevelingCog(commands.Cog):
 
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(LevelingCog(bot))
+    await bot.add_cog(LevelingCog(bot))
