@@ -127,45 +127,67 @@ class Dice(commands.Cog):
             await self._send_result(message, desc, is_secret)
             return
 
-        # パターン3: 通常のダイスロール (例: 2d6, 1d100+10, 3d6-2, s1d100)
-        dice_match = re.match(r"^(s)?(\d+)d(\d+)(?:([+-])(\d+))?$", content, re.IGNORECASE)
-        if dice_match:
+        # パターン3: 複数ダイス・加減算対応ロール (例: 1d4+1d3, 2d6+3, s1d100+5)
+        # 先頭の 's' の有無をチェック
+        is_secret = False
+        roll_content = content
+        if roll_content.lower().startswith('s'):
+            is_secret = True
+            roll_content = roll_content[1:]
+
+        # ダイス式の簡易バリデーション（数字、d、+-のみで構成されているか）
+        if re.match(r"^\d+d\d+(?:[+-]\d+d\d+|[+-]\d+)*$", roll_content, re.IGNORECASE):
             if not await self.get_enabled(message.guild.id):
                 return
-            is_secret = bool(dice_match.group(1))
-            count = int(dice_match.group(2))
-            sides = int(dice_match.group(3))
-            op = dice_match.group(4)
-            mod = int(dice_match.group(5)) if dice_match.group(5) else 0
 
-            if count <= 0 or sides <= 0 or count > 100 or sides > 100000:
+            try:
+                desc = self._eval_complex_dice(roll_content)
+                await self._send_result(message, desc, is_secret)
                 return
+            except Exception:
+                pass  |# パースや計算に失敗した場合は無視してスルー
 
-            results = [random.randint(1, sides) for _ in range(count)]
-            raw_sum = sum(results)
+    def _eval_complex_dice(self, expr: str) -> str:
+        """複数ダイスや加減算が含まれる式を計算する"""
+        # トークン（ダイスまたは定数）に分解して抽出
+        tokens = re.findall(r"([+-]?)(?:(\d+)d(\d+)|(\d+))", expr, re.IGNORECASE)
+        
+        total = 0
+        details = []
+        
+        for sign, count_str, sides_str, const_str in tokens:
+            op = -1 if sign == "-" else 1
+            
+            if count_str and sides_str:
+                count = int(count_str)
+                sides = int(sides_str)
+                if count <= 0 or sides <= 0 or count > 50 or sides > 100000:
+                    raise ValueError("Invalid dice range")
+                
+                rolls = [random.randint(1, sides) for _ in range(count)]
+                sub_sum = sum(rolls)
+                total += op * sub_sum
+                
+                # 表示形式の調整
+                sign_char = "-" if op == -1 else ("+" if details else "")
+                rolls_repr = ",".join(map(str, rolls))
+                if len(rolls_repr) > 50:
+                    rolls_repr = "..."
+                details.append(f"{sign_char}{count}d{sides}[{rolls_repr}]")
+                
+            elif const_str:
+                val = int(const_str)
+                total += op * val
+                sign_char = "-" if op == -1 else ("+" if details else "")
+                details.append(f"{sign_char}{val}")
 
-            if op == "+":
-                total = raw_sum + mod
-                mod_str = f"+{mod}"
-            elif op == "-":
-                total = raw_sum - mod
-                mod_str = f"-{mod}"
-            else:
-                total = raw_sum
-                mod_str = ""
+        expr_cleaned = expr.upper()
+        details_str = "".join(details)
+        # 先頭の不要なプラスを取り除く
+        if details_str.startswith("+"):
+            details_str = details_str[1:]
 
-            dice_expr = f"{count}D{sides}{mod_str}"
-
-            if count > 1:
-                results_str = ", ".join(map(str, results))
-                if len(results_str) > 1800:
-                    results_str = "出目多数につき省略"
-                desc = f"**{dice_expr}**\n[{results_str}]{mod_str} ➔ **{total}**"
-            else:
-                desc = f"**{dice_expr}**\n[{results[0]}]{mod_str} ➔ **{total}**"
-
-            await self._send_result(message, desc, is_secret)
-            return
+        return f"**{expr_cleaned}**\n{details_str} ➔ **{total}**"
 
     def _eval_coc6(self, val: int, target: int | None) -> str:
         """CoC 6版の勝敗判定 logic"""
