@@ -23,8 +23,6 @@ class Dice(commands.Cog):
         self.pool = await get_pool(self.bot)
 
         async with self.pool.acquire() as connection:
-            # 以前は setting.py と同じ guild_settings テーブルを共用していたが、
-            # 列定義が衝突するため専用テーブルに分離した
             await connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS dice_settings (
@@ -33,7 +31,6 @@ class Dice(commands.Cog):
                 )
                 """
             )
-            # 旧テーブルに保存済みの設定を一度だけ引き継ぐ（既にある設定は上書きしない）
             has_old_column = await connection.fetchval(
                 """
                 SELECT EXISTS (
@@ -100,38 +97,116 @@ class Dice(commands.Cog):
         if message.author.bot or not message.guild:
             return
 
-        # 先に軽いパターン判定をして、無関係なメッセージではDBを見に行かない
-        match = re.search(r"\b(\d+)d(\d+)\b", message.content.lower())
-        if not match:
+        content = message.content.strip()
+
+        # パターン1: チョイス機能 (choice[A,B] や choice A B C)
+        choice_match = re.match(r"^(s)?choice(?:\[|\s+)(.+?)(?:\])?$", content, re.IGNORECASE)
+        if choice_match:
+            if not await self.get_enabled(message.guild.id):
+                return
+            is_secret = bool(choice_match.group(1))
+            raw_options = choice_match.group(2)
+            options = [opt.strip() for opt in re.split(r"[,/,\s]+", raw_options) if opt.strip()]
+            if options:
+                chosen = random.choice(options)
+                desc = f"**choice[{','.join(options)}]** ➔ **{chosen}**"
+                await self._send_result(message, desc, is_secret)
             return
 
-        if not await self.get_enabled(message.guild.id):
+        # パターン2: CoC 6版 CCB / CC (例: CCB<=50, CC<=65)
+        ccb_match = re.match(r"^(s)?ccb?(?:<=?(\d+))?$", content, re.IGNORECASE)
+        if ccb_match:
+            if not await self.get_enabled(message.guild.id):
+                return
+            is_secret = bool(ccb_match.group(1))
+            target_str = ccb_match.group(2)
+            target = int(target_str) if target_str else None
+
+            val = random.randint(1, 100)
+            desc = self._eval_coc6(val, target)
+            await self._send_result(message, desc, is_secret)
             return
 
-        count = int(match.group(1))
-        sides = int(match.group(2))
-        dice_str = f"{count}d{sides}"
+        # パターン3: 通常のダイスロール (例: 2d6, 1d100+10, 3d6-2, s1d100)
+        dice_match = re.match(r"^(s)?(\d+)d(\d+)(?:([+-])(\d+))?$", content, re.IGNORECASE)
+        if dice_match:
+            if not await self.get_enabled(message.guild.id):
+                return
+            is_secret = bool(dice_match.group(1))
+            count = int(dice_match.group(2))
+            sides = int(dice_match.group(3))
+            op = dice_match.group(4)
+            mod = int(dice_match.group(5)) if dice_match.group(5) else 0
 
-        if count <= 0 or sides <= 0 or count > 100 or sides > 100000:
+            if count <= 0 or sides <= 0 or count > 100 or sides > 100000:
+                return
+
+            results = [random.randint(1, sides) for _ in range(count)]
+            raw_sum = sum(results)
+
+            if op == "+":
+                total = raw_sum + mod
+                mod_str = f"+{mod}"
+            elif op == "-":
+                total = raw_sum - mod
+                mod_str = f"-{mod}"
+            else:
+                total = raw_sum
+                mod_str = ""
+
+            dice_expr = f"{count}D{sides}{mod_str}"
+
+            if count > 1:
+                results_str = ", ".join(map(str, results))
+                if len(results_str) > 1800:
+                    results_str = "出目多数につき省略"
+                desc = f"**{dice_expr}**\n[{results_str}]{mod_str} ➔ **{total}**"
+            else:
+                desc = f"**{dice_expr}**\n[{results[0]}]{mod_str} ➔ **{total}**"
+
+            await self._send_result(message, desc, is_secret)
             return
 
-        results = [random.randint(1, sides) for _ in range(count)]
-        total = sum(results)
+    def _eval_coc6(self, val: int, target: int | None) -> str:
+        """CoC 6版の勝敗判定 logic"""
+        expr_str = "CCB" if target is None else f"CCB<={target}"
+        if target is None:
+            return f"**{expr_str}** ➔ **{val}**"
 
-        if count > 1:
-            results_str = ", ".join(map(str, results))
-            if len(results_str) > 1900:
-                results_str = " (出目が多すぎるため省略されました) "
-            description = f"**{dice_str}**\n[{results_str}] > {total}"
+        if val <= target:
+            if val <= 5:
+                res = "決定的成功 (クリティカル)"
+            elif val <= max(1, target // 5):
+                res = "スペシャル"
+            else:
+                res = "成功"
         else:
-            description = f"**{dice_str}**\n[{results[0]}] > {total}"
+            if val >= 96:
+                res = "致命的失敗 (ファンブル)"
+            else:
+                res = "失敗"
 
+        return f"**{expr_str}** ➔ [{val}] ➔ **{res}**"
+
+    async def _send_result(self, message: discord.Message, description: str, is_secret: bool):
+        """結果の送信制御（シークレットダイス対応）"""
         embed = discord.Embed(
             description=description,
             color=discord.Color.dark_embed()
         )
 
-        await message.reply(embed=embed, mention_author=False)
+        if is_secret:
+            try:
+                await message.author.send(f"🔒 **[シークレットダイス]** ({message.channel.mention})\n" + description)
+                notice_embed = discord.Embed(
+                    description=f"🔒 {message.author.mention} がシークレットダイスを振りました。",
+                    color=discord.Color.dark_gray()
+                )
+                await message.reply(embed=notice_embed, mention_author=False)
+            except discord.Forbidden:
+                await message.reply("❌ DMがブロックされているためシークレットダイスを送信できませんでした。", delete_after=10)
+        else:
+            await message.reply(embed=embed, mention_author=False)
 
 
 async def setup(bot):
