@@ -99,122 +99,141 @@ class Dice(commands.Cog):
 
         content = message.content.strip()
 
-        # パターン1: チョイス機能 (choice[A,B] や choice A B C)
-        choice_match = re.match(r"^(s)?choice(?:\[|\s+)(.+?)(?:\])?$", content, re.IGNORECASE)
+        # パターン1: チョイス機能 (例: choice[A,B] 焼肉か寿司)
+        choice_match = re.match(r"^(s)?choice(?:\[|\s+)(.+?)(?:\])?(?:\s+(.+))?$", content, re.IGNORECASE)
         if choice_match:
             if not await self.get_enabled(message.guild.id):
                 return
             is_secret = bool(choice_match.group(1))
             raw_options = choice_match.group(2)
+            memo = choice_match.group(3)
             options = [opt.strip() for opt in re.split(r"[,/,\s]+", raw_options) if opt.strip()]
             if options:
                 chosen = random.choice(options)
-                desc = f"**choice[{','.join(options)}]** ➔ **{chosen}**"
-                await self._send_result(message, desc, is_secret)
+                memo_str = f" ({memo})" if memo else ""
+                desc = f"**choice[{','.join(options)}]{memo_str}** ➔ **{chosen}**"
+                await self._send_result(message, desc, is_secret, color=discord.Color.dark_embed())
             return
 
-        # パターン2: CoC 6版 CCB / CC (例: CCB<=50, CC<=65)
-        ccb_match = re.match(r"^(s)?ccb?(?:<=?(\d+))?$", content, re.IGNORECASE)
+        # パターン2: CoC 6版 CCB / CC (例: CCB<=50 目星, CC<=65 組みつき)
+        ccb_match = re.match(r"^(s)?ccb?(?:<=?(\d+))?(?:\s+(.+))?$", content, re.IGNORECASE)
         if ccb_match:
             if not await self.get_enabled(message.guild.id):
                 return
             is_secret = bool(ccb_match.group(1))
             target_str = ccb_match.group(2)
             target = int(target_str) if target_str else None
+            memo = ccb_match.group(3)
 
             val = random.randint(1, 100)
-            desc = self._eval_coc6(val, target)
-            await self._send_result(message, desc, is_secret)
+            desc, color = self._eval_coc6(val, target, memo)
+            await self._send_result(message, desc, is_secret, color)
             return
 
-        # パターン3: 複数ダイス・加減算対応ロール (例: 1d4+1d3, 2d6+3, s1d100+5)
-        # 先頭の 's' の有無をチェック
+        # パターン3: 通常のダイスロール (例: 1d100 目星, 2d6+3 ダメージ, s1d100)
         is_secret = False
         roll_content = content
         if roll_content.lower().startswith('s'):
             is_secret = True
             roll_content = roll_content[1:]
 
-        # ダイス式の簡易バリデーション（数字、d、+-のみで構成されているか）
-        if re.match(r"^\d+d\d+(?:[+-]\d+d\d+|[+-]\d+)*$", roll_content, re.IGNORECASE):
+        dice_match = re.match(r"^(\d+)d(\d+)(?:([+-])(\d+))?(?:\s+(.+))?$", roll_content, re.IGNORECASE)
+        if dice_match:
             if not await self.get_enabled(message.guild.id):
                 return
 
-            try:
-                desc = self._eval_complex_dice(roll_content)
-                await self._send_result(message, desc, is_secret)
+            count = int(dice_match.group(1))
+            sides = int(dice_match.group(2))
+            op = dice_match.group(3)
+            mod = int(dice_match.group(4)) if dice_match.group(4) else 0
+            memo = dice_match.group(5)
+
+            if count <= 0 or sides <= 0 or count > 50 or sides > 100000:
                 return
+
+            try:
+                results = [random.randint(1, sides) for _ in range(count)]
+                raw_sum = sum(results)
+
+                if op == "+":
+                    total = raw_sum + mod
+                    mod_str = f"+{mod}"
+                elif op == "-":
+                    total = raw_sum - mod
+                    mod_str = f"-{mod}"
+                else:
+                    total = raw_sum
+                    mod_str = ""
+
+                dice_expr = f"{count}D{sides}{mod_str}"
+                memo_str = f" ({memo})" if memo else ""
+
+                color = discord.Color.dark_embed()
+                extra_res = ""
+
+                # 💡 1d100単体（または修正付き1d100）の場合のクリファン判定
+                if count == 1 and sides == 100 and not op:
+                    if results[0] <= 5:
+                        extra_res = " ➔ **決定的成功 (クリティカル)**"
+                        color = discord.Color.gold()
+                    elif results[0] >= 96:
+                        extra_res = " ➔ **致命的失敗 (ファンブル)**"
+                        color = discord.Color.dark_gray()
+
+                if count > 1:
+                    results_str = ", ".join(map(str, results))
+                    if len(results_str) > 1800:
+                        results_str = "出目多数につき省略"
+                    desc = f"**{dice_expr}{memo_str}**\n[{results_str}]{mod_str} ➔ **{total}**{extra_res}"
+                else:
+                    desc = f"**{dice_expr}{memo_str}**\n[{results[0]}]{mod_str} ➔ **{total}**{extra_res}"
+
+                await self._send_result(message, desc, is_secret, color)
             except Exception:
-                pass  # パースや計算に失敗した場合は無視してスルー
+                pass
 
-    def _eval_complex_dice(self, expr: str) -> str:
-        """複数ダイスや加減算が含まれる式を計算する"""
-        # トークン（ダイスまたは定数）に分解して抽出
-        tokens = re.findall(r"([+-]?)(?:(\d+)d(\d+)|(\d+))", expr, re.IGNORECASE)
-        
-        total = 0
-        details = []
-        
-        for sign, count_str, sides_str, const_str in tokens:
-            op = -1 if sign == "-" else 1
-            
-            if count_str and sides_str:
-                count = int(count_str)
-                sides = int(sides_str)
-                if count <= 0 or sides <= 0 or count > 50 or sides > 100000:
-                    raise ValueError("Invalid dice range")
-                
-                rolls = [random.randint(1, sides) for _ in range(count)]
-                sub_sum = sum(rolls)
-                total += op * sub_sum
-                
-                # 表示形式の調整
-                sign_char = "-" if op == -1 else ("+" if details else "")
-                rolls_repr = ",".join(map(str, rolls))
-                if len(rolls_repr) > 50:
-                    rolls_repr = "..."
-                details.append(f"{sign_char}{count}d{sides}[{rolls_repr}]")
-                
-            elif const_str:
-                val = int(const_str)
-                total += op * val
-                sign_char = "-" if op == -1 else ("+" if details else "")
-                details.append(f"{sign_char}{val}")
-
-        expr_cleaned = expr.upper()
-        details_str = "".join(details)
-        # 先頭の不要なプラスを取り除く
-        if details_str.startswith("+"):
-            details_str = details_str[1:]
-
-        return f"**{expr_cleaned}**\n{details_str} ➔ **{total}**"
-
-    def _eval_coc6(self, val: int, target: int | None) -> str:
-        """CoC 6版の勝敗判定 logic"""
+    def _eval_coc6(self, val: int, target: int | None, memo: str | None) -> tuple[str, discord.Color]:
+        """CoC 6版の勝敗判定 logic (結果に応じたカラーを返す)"""
+        memo_str = f" ({memo})" if memo else ""
         expr_str = "CCB" if target is None else f"CCB<={target}"
+        
         if target is None:
-            return f"**{expr_str}** ➔ **{val}**"
+            # 目標値なしのCCBの場合は単体1d100と同じ扱い
+            color = discord.Color.dark_embed()
+            res_str = f"**{expr_str}{memo_str}** ➔ **{val}**"
+            if val <= 5:
+                res_str += " ➔ **決定的成功 (クリティカル)**"
+                color = discord.Color.gold()
+            elif val >= 96:
+                res_str += " ➔ **致命的失敗 (ファンブル)**"
+                color = discord.Color.dark_gray()
+            return res_str, color
 
         if val <= target:
             if val <= 5:
                 res = "決定的成功 (クリティカル)"
+                color = discord.Color.gold()
             elif val <= max(1, target // 5):
                 res = "スペシャル"
+                color = discord.Color.green()
             else:
                 res = "成功"
+                color = discord.Color.green()
         else:
             if val >= 96:
                 res = "致命的失敗 (ファンブル)"
+                color = discord.Color.dark_gray()
             else:
                 res = "失敗"
+                color = discord.Color.red()
 
-        return f"**{expr_str}** ➔ [{val}] ➔ **{res}**"
+        return f"**{expr_str}{memo_str}** ➔ [{val}] ➔ **{res}**", color
 
-    async def _send_result(self, message: discord.Message, description: str, is_secret: bool):
-        """結果の送信制御（シークレットダイス対応）"""
+    async def _send_result(self, message: discord.Message, description: str, is_secret: bool, color: discord.Color):
+        """結果の送信制御（シークレットダイスおよびカラー対応）"""
         embed = discord.Embed(
             description=description,
-            color=discord.Color.dark_embed()
+            color=color
         )
 
         if is_secret:
