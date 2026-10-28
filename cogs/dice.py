@@ -145,7 +145,7 @@ class Dice(commands.Cog):
                 await self._send_result(message, desc, is_secret)
                 return
             except Exception:
-                pass  |# パースや計算に失敗した場合は無視してスルー
+                pass  # パースや計算に失敗した場合は無視してスルー
 
     def _eval_complex_dice(self, expr: str) -> str:
         """複数ダイスや加減算が含まれる式を計算する"""
@@ -233,4 +233,3 @@ class Dice(commands.Cog):
 
 async def setup(bot):
     await bot.add_cog(Dice(bot))
-    
