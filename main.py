@@ -269,35 +269,22 @@ def run() -> None:
 if __name__ == "__main__":
     run()
 
-import logging
-import requests
-
 # ==========================================
-# 1. Discord Webhookへの送信設定
+# 設定 & ログ送信関数（botを引数で受け取る安全な設計）
 # ==========================================
-WEBHOOK_URL = "https://discord.com/api/webhooks/1565164095723016202/N7gStX4l7ggYD6mg-lw_Muc5-drQBL5MEVOXsBDs6gUicS5wZci9G6LPpwGU_lu02KKU"
+LOG_CHANNEL_ID = 1565155365207674970  # ログ用チャンネルID
 
-class DiscordHandler(logging.Handler):
-    def emit(self, record):
-        log_entry = self.format(record)
-        # Discordの文字数制限（2000文字）対策
-        if len(log_entry) > 1900:
-            log_entry = log_entry[:1900] + "..."
-            
-        # エラーのときは強調表示をつける
-        prefix = "🚨 **エラー発生**\n" if record.levelno >= logging.ERROR else ""
-        payload = {"content": f"{prefix}```\n{log_entry}\n```"}
+async def send_log_to_discord(bot_instance, title: str, message: str):
+    """引数で受け取った bot インスタンスを利用して、指定チャンネルに直接メッセージを送る"""
+    try:
+        channel = bot_instance.get_channel(LOG_CHANNEL_ID)
+        if channel is None:
+            channel = await bot_instance.fetch_channel(LOG_CHANNEL_ID)
         
-        try:
-            requests.post(WEBHOOK_URL, json=payload, timeout=5)
-        except Exception:
-            pass
+        if channel:
+            if len(message) > 1900:
+                message = message[:1900] + "..."
+            await channel.send(f"🚨 **{title}**\n```\n{message}\n```")
+    except Exception as e:
+        print(f"[Discord送信エラー]: {e}")
 
-# ロガーの初期設定
-logger = logging.getLogger("BotLogger")
-logger.setLevel(logging.INFO)
-
-if not logger.handlers:
-    handler = DiscordHandler()
-    handler.setFormatter(logging.Formatter("[%(levelname)s] %(asctime)s: %(message)s"))
-    logger.addHandler(handler)
