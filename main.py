@@ -288,3 +288,21 @@ async def send_log_to_discord(bot_instance, title: str, message: str):
     except Exception as e:
         print(f"[Discord送信エラー]: {e}")
 
+
+# ==========================================
+# 動作確認・テスト用のスラッシュコマンド
+# （※ 実際のファイルにある bot のインスタンス変数名に合わせてください。例: bot や client など）
+# ==========================================
+@bot.tree.command(name="test-error", description="エラーログ送信のテストを行います")
+async def test_error(interaction: discord.Interaction):
+    try:
+        1 / 0
+    except Exception as e:
+        error_msg = f"テストエラー詳細: {e}"
+        print(error_msg)
+        
+        # 呼び出すときにご自身のBot変数（botなど）を渡す
+        await send_log_to_discord(bot, "テストエラー発生", error_msg)
+        
+        await interaction.response.send_message("エラーを発生させ、ログチャンネルに送信しました！", ephemeral=True)        
+
