@@ -268,3 +268,36 @@ def run() -> None:
 
 if __name__ == "__main__":
     run()
+
+import logging
+import requests
+
+# ==========================================
+# 1. Discord Webhookへの送信設定
+# ==========================================
+WEBHOOK_URL = "https://discord.com/api/webhooks/1565164095723016202/N7gStX4l7ggYD6mg-lw_Muc5-drQBL5MEVOXsBDs6gUicS5wZci9G6LPpwGU_lu02KKU"
+
+class DiscordHandler(logging.Handler):
+    def emit(self, record):
+        log_entry = self.format(record)
+        # Discordの文字数制限（2000文字）対策
+        if len(log_entry) > 1900:
+            log_entry = log_entry[:1900] + "..."
+            
+        # エラーのときは強調表示をつける
+        prefix = "🚨 **エラー発生**\n" if record.levelno >= logging.ERROR else ""
+        payload = {"content": f"{prefix}```\n{log_entry}\n```"}
+        
+        try:
+            requests.post(WEBHOOK_URL, json=payload, timeout=5)
+        except Exception:
+            pass
+
+# ロガーの初期設定
+logger = logging.getLogger("BotLogger")
+logger.setLevel(logging.INFO)
+
+if not logger.handlers:
+    handler = DiscordHandler()
+    handler.setFormatter(logging.Formatter("[%(levelname)s] %(asctime)s: %(message)s"))
+    logger.addHandler(handler)
