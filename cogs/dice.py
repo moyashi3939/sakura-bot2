@@ -99,23 +99,60 @@ class Dice(commands.Cog):
 
         content = message.content.strip()
 
-        # パターン1: チョイス機能 (例: choice[A,B] 焼肉か寿司)
-        choice_match = re.match(r"^(s)?choice(?:\[|\s+)(.+?)(?:\])?(?:\s+(.+))?$", content, re.IGNORECASE)
+        # パターン1: チョイス機能
+        # 例: choice[A,B], choice[u] A,B,C, choice[2] A,B,C, choice[u 2] A,B,C, schoice[unique 3] A,B,C,D
+        choice_match = re.match(
+            r"^(s)?choice(?:\[\s*(u(?:nique)?)?(?:\s*(\d+))?\s*\]|\s+)?(.+?)(?:\])?(?:\s+(.+))?$",
+            content,
+            re.IGNORECASE
+        )
         if choice_match:
             if not await self.get_enabled(message.guild.id):
                 return
             is_secret = bool(choice_match.group(1))
-            raw_options = choice_match.group(2)
-            memo = choice_match.group(3)
+            mode_flag = choice_match.group(2)
+            count_str = choice_match.group(3)
+            raw_options = choice_match.group(4)
+            memo = choice_match.group(5)
+
+            is_unique = bool(mode_flag)
+            pick_count = int(count_str) if count_str else 1
+
+            # カンマやスペースで選択肢を分割
             options = [opt.strip() for opt in re.split(r"[,/,\s]+", raw_options) if opt.strip()]
             if options:
-                chosen = random.choice(options)
+                if pick_count <= 0:
+                    return
+
+                # 重複なし（unique/u）指定の場合、または pick_count > 1 の場合の処理
+                if is_unique:
+                    # 重複なし：選択肢の数を超えて選ぶことはできない
+                    if pick_count > len(options):
+                        pick_count = len(options)
+                    chosen_list = random.sample(options, pick_count)
+                else:
+                    # 重複あり：通常はランダムに選ぶ（pick_countが2以上なら重複を許して複数抽選）
+                    if pick_count == 1:
+                        chosen_list = [random.choice(options)]
+                    else:
+                        chosen_list = [random.choice(options) for _ in range(pick_count)]
+
                 memo_str = f" ({memo})" if memo else ""
-                desc = f"**choice[{','.join(options)}]{memo_str}** ➔ **{chosen}**"
+                
+                # 表示用の設定文字列を構築
+                flags = []
+                if is_unique:
+                    flags.append("u")
+                if pick_count > 1 or count_str:
+                    flags.append(str(pick_count))
+                flag_str = f"[{' '.join(flags)}]" if flags else ""
+
+                chosen_str = ", ".join(chosen_list)
+                desc = f"**choice{flag_str}[{','.join(options)}]{memo_str}** ➔ **{chosen_str}**"
                 await self._send_result(message, desc, is_secret, color=discord.Color.dark_embed())
             return
 
-        # パターン2: CoC 6版 CCB / CC (例: CCB<=50 目星, CC<=65 組みつき)
+        # パターン2: CoC 6版 CCB / CC
         ccb_match = re.match(r"^(s)?ccb?(?:<=?(\d+))?(?:\s+(.+))?$", content, re.IGNORECASE)
         if ccb_match:
             if not await self.get_enabled(message.guild.id):
@@ -130,7 +167,7 @@ class Dice(commands.Cog):
             await self._send_result(message, desc, is_secret, color)
             return
 
-        # パターン3: 通常のダイスロール (例: 1d100 目星, 2d6+3 ダメージ, s1d100)
+        # パターン3: 通常のダイスロール
         is_secret = False
         roll_content = content
         if roll_content.lower().startswith('s'):
@@ -145,7 +182,7 @@ class Dice(commands.Cog):
             count = int(dice_match.group(1))
             sides = int(dice_match.group(2))
             op = dice_match.group(3)
-            mod = int(dice_match.group(4)) if dice_match.group(4) else 0
+            mod_val = int(dice_match.group(4)) if dice_match.group(4) else 0
             memo = dice_match.group(5)
 
             if count <= 0 or sides <= 0 or count > 50 or sides > 100000:
@@ -156,11 +193,11 @@ class Dice(commands.Cog):
                 raw_sum = sum(results)
 
                 if op == "+":
-                    total = raw_sum + mod
-                    mod_str = f"+{mod}"
+                    total = raw_sum + mod_val
+                    mod_str = f"+{mod_val}"
                 elif op == "-":
-                    total = raw_sum - mod
-                    mod_str = f"-{mod}"
+                    total = raw_sum - mod_val
+                    mod_str = f"-{mod_val}"
                 else:
                     total = raw_sum
                     mod_str = ""
@@ -171,7 +208,6 @@ class Dice(commands.Cog):
                 color = discord.Color.dark_embed()
                 extra_res = ""
 
-                # 💡 1d100単体（または修正付き1d100）の場合のクリファン判定
                 if count == 1 and sides == 100 and not op:
                     if results[0] <= 5:
                         extra_res = " ➔ **決定的成功 (クリティカル)**"
@@ -193,12 +229,11 @@ class Dice(commands.Cog):
                 pass
 
     def _eval_coc6(self, val: int, target: int | None, memo: str | None) -> tuple[str, discord.Color]:
-        """CoC 6版の勝敗判定 logic (結果に応じたカラーを返す)"""
+        """CoC 6版の勝敗判定 logic"""
         memo_str = f" ({memo})" if memo else ""
         expr_str = "CCB" if target is None else f"CCB<={target}"
         
         if target is None:
-            # 目標値なしのCCBの場合は単体1d100と同じ扱い
             color = discord.Color.dark_embed()
             res_str = f"**{expr_str}{memo_str}** ➔ **{val}**"
             if val <= 5:
@@ -230,7 +265,7 @@ class Dice(commands.Cog):
         return f"**{expr_str}{memo_str}** ➔ [{val}] ➔ **{res}**", color
 
     async def _send_result(self, message: discord.Message, description: str, is_secret: bool, color: discord.Color):
-        """結果の送信制御（シークレットダイスおよびカラー対応）"""
+        """結果の送信制御"""
         embed = discord.Embed(
             description=description,
             color=color
